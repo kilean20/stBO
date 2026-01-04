@@ -1,0 +1,29 @@
+from __future__ import annotations
+
+from .common import BOUNDS
+from stbo.optimization import BOController
+from stbo.oracles import RosenbrockOracle
+
+
+def run(smoke: bool = False) -> float:
+    print("=== Example 1: Global init -> UCB -> qUCB ===")
+    oracle = RosenbrockOracle(delay_s=0.0 if smoke else 0.05)
+    bo = BOController(oracle, BOUNDS)
+
+    bo.initialize(budget=3 if smoke else 5, seed=0)
+    n1 = 2 if smoke else 5
+    n2 = 2 if smoke else 5
+
+    for _ in range(n1):
+        bo.step(mode="global", acq_type="UCB", acq_config={"beta": 4}, fresh_train=True, plot_acq=False)
+    for _ in range(n2):
+        bo.step(mode="global", acq_type="qUCB", acq_config={"beta": 4}, fresh_train=False, plot_acq=False)
+
+    bo.finalize()
+    best = max(h["y"] for h in bo.history)
+    print("Best y:", best)
+    return float(best)
+
+
+if __name__ == "__main__":
+    run(smoke=False)
