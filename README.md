@@ -1,7 +1,7 @@
 # stBO (singleTaskBO)
 
 `stBO` is a small, opinionated wrapper around **BoTorch** to run **single-task Bayesian Optimization**
-with optional *physics-aware* ramping/polarity/pending-point cost terms and a simple TuRBO-1-style trust region.
+with optional *cost-aware* ramping/polarity/pending-point cost terms and a simple TuRBO-1-style trust region.
 
 ## Install (editable)
 ```bash
@@ -27,12 +27,7 @@ print("Best y:", best)
 ```
 
 ## Examples
-See `examples/` for four runnable scripts mirroring the original demos.
-
-- `examples/01_global_then_qucb.py`
-- `examples/02_prior_mean.py`
-- `examples/03_local_then_finetune.py`
-- `examples/04_fixed_features.py`
+See `examples/` for runnable scripts 
 
 ## Development (tests + lint)
 ```bash
