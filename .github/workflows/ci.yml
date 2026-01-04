@@ -27,5 +27,6 @@ jobs:
       - name: Run tests
         env:
           MPLBACKEND: Agg
-        run: |
-          pytest
+          PYTHONPATH: .
+        run: pytest
+
