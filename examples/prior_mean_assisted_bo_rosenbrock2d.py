@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .common import BOUNDS
+from .common import ROSENBROCK2D_BOUNDS as BOUNDS
 from .rosenbrock_prior import RosenbrockPrior
 from stbo.optimization import BOController
 from stbo.oracles import RosenbrockOracle
