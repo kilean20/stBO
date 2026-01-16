@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
-import matplotlib
+import matplotlib.pyplot as plt
 
 from botorch.optim import optimize_acqf
 
@@ -36,6 +36,7 @@ class BOController:
         prior_mean: Optional[PriorMean] = None,
         kernel_type: str = "matern",
         max_workers: int = 1,
+        adjust_trust_region: bool = True,
     ):
         self.oracle = oracle_evaluator
         self.bounds = bounds.to(dtype=torch.float64)
@@ -50,19 +51,23 @@ class BOController:
         self.train_x: list[torch.Tensor] = []
         self.train_y: list[torch.Tensor] = []
         self.history: list[Dict[str, Any]] = []
-        self.timing = {"train": [], "search": [], "oracle": []}
+        self.timing = {"train": [], "search": [], "oracle": [], "total": []}
 
         # initial poll
         init_res = self.oracle(x=None)
         self.X_last = torch.tensor(init_res["x"], dtype=torch.float64)
 
+        self.adjust_trust_region = bool(adjust_trust_region)
         self.tr_state = TrustRegionState(bounds.shape[1], self.bounds)
         self.tr_state.center = self.X_last
         self.tr_state.best_value = float(init_res["y"])
 
         self.last_acq_object = None
+        self.t_submit = None
 
     def _register_data(self, res: Dict[str, Any]) -> None:
+        if self.t_submit is None:
+            self.t_submit = time.time()
         if "t_start" in res and "t_end" in res:
             dt = (res["t_end"] - res["t_start"]).total_seconds()
             self.timing["oracle"].append(dt)
@@ -75,9 +80,11 @@ class BOController:
         self.history.append(res)
 
         self.X_last = torch.tensor(x_val, dtype=torch.float64)
-        self.tr_state.update(y_val, self.X_last)
+        self.tr_state.update(y_val, self.X_last, adjust_trust_region=self.adjust_trust_region)
+        self.timing["total"].append(time.time() - self.t_submit)
 
     def _submit_job(self, x: torch.Tensor) -> None:
+        self.t_submit = time.time()
         self.X_candidate = x
 
         def task():
@@ -132,8 +139,11 @@ class BOController:
         for i in range(budget - 1):
             self._submit_job(samples[i])
             self._register_data(self.current_future.result())
+            self.timing["train"].append(None)
+            self.timing["search"].append(None)
 
         self._submit_job(samples[-1])
+
 
     def _auto_ramp_cost_config(self, base_acq, *, asynchro: bool, mode: str) -> Dict[str, Any]:
         mode = mode.lower()
@@ -205,6 +215,7 @@ class BOController:
         optimize_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         """One BO step (optimize acquisition, submit point, optionally async)."""
+
         if (not asynchro) and (self.current_future is not None):
             self._register_data(self.current_future.result())
 
@@ -267,6 +278,7 @@ class BOController:
 
         self._submit_job(candidate.detach().squeeze(0))
 
+
     def finalize(self) -> None:
         if self.current_future is not None:
             self._register_data(self.current_future.result())
@@ -289,13 +301,12 @@ class BOController:
         if self.bounds.shape[1] != 2:
             raise ValueError("plot_acq only supports 2D bounds.")
 
-        # Make matplotlib CI-friendly
-        try:
-            matplotlib.use("Agg", force=False)
-        except Exception:
-            pass
+        # # Make matplotlib CI-friendly
+        # try:
+        #     matplotlib.use("Agg", force=False)
+        # except Exception:
+        #     pass
 
-        import matplotlib.pyplot as plt  # local import
 
         bounds = self.bounds
         x = np.linspace(bounds[0, 0].item(), bounds[1, 0].item(), n_each)
@@ -349,19 +360,149 @@ class BOController:
         axes[0].legend()
         plt.tight_layout()
         return fig, axes
+    
+    def plot_history(
+        self,
+        fig=None,
+        axes=None,
+        *,
+        maximize: bool = True,
+        title: str | None = None,
+        show: bool = True,
+    ):
+        """
+        Plot a two-panel summary of the BO run:
+        (1) Objective history + best-so-far
+        (2) Timing breakdown per iteration
 
-    def plot_timecost(self, fig=None, ax=None):
-        try:
-            matplotlib.use("Agg", force=False)
-        except Exception:
-            pass
-        import matplotlib.pyplot as plt  # local import
+        Parameters
+        ----------
+        fig : matplotlib.figure.Figure | None
+            Existing figure to draw on. If None, a new one is created.
+        axes : tuple[matplotlib.axes.Axes, matplotlib.axes.Axes] | None
+            Existing axes (ax_obj, ax_time). If None, new subplots are created.
+        maximize : bool
+            Whether larger objective values are better (True) or smaller are better (False).
+        title : str | None
+            Figure title (suptitle). If None, a default is used.
+        show : bool
+            If True, calls plt.show() at the end (useful in scripts).
 
-        if fig is None:
-            fig, ax = plt.subplots(figsize=(8, 4))
-        ax.plot(self.timing["train"], label="Train Time")
-        ax.plot(self.timing["search"], label="Acq Opt Time")
-        ax.plot(self.timing["oracle"], label="Oracle Time")
-        ax.legend()
-        plt.tight_layout()
-        return fig, ax
+        Returns
+        -------
+        (fig, (ax_obj, ax_time))
+        """
+        import numpy as np
+        import matplotlib.pyplot as plt
+        from matplotlib import rc_context
+
+        # --- Collect objective history ---
+        ys = []
+        for h in getattr(self, "history", []):
+            y = h.get("y", None)
+            if y is None:
+                continue
+            if hasattr(y, "detach"):  # torch
+                y = y.detach().cpu().item()
+            elif hasattr(y, "item"):  # numpy scalar
+                y = y.item()
+            ys.append(float(y))
+
+        if len(ys) == 0:
+            raise ValueError("No objective values found: expected bo.history[*]['y'].")
+
+        y = np.asarray(ys, dtype=float)
+        x_obj = np.arange(1, len(y) + 1)
+
+        best_so_far = np.maximum.accumulate(y) if maximize else np.minimum.accumulate(y)
+        best_idx = int(np.argmax(best_so_far) if maximize else np.argmin(best_so_far))
+        best_x = x_obj[best_idx]
+        best_y = best_so_far[best_idx]
+
+        # --- Collect timing history ---
+        timing = getattr(self, "timing", {}) or {}
+        train_t = np.asarray(timing.get("train", []), dtype=float)
+        search_t = np.asarray(timing.get("search", []), dtype=float)
+        oracle_t = np.asarray(timing.get("oracle", []), dtype=float)
+        total_t = np.asarray(timing.get("total", []), dtype=float)
+
+        # x-axis for timing (may differ in length from objective)
+        n_time = max(len(train_t), len(search_t), len(oracle_t), 0)
+        x_time = np.arange(1, n_time + 1)
+
+        def _pad(arr, n):
+            if len(arr) == 0:
+                return np.full(n, np.nan)
+            if len(arr) >= n:
+                return arr[:n]
+            out = np.full(n, np.nan)
+            out[: len(arr)] = arr
+            return out
+
+        train_t = _pad(train_t, n_time)
+        search_t = _pad(search_t, n_time)
+        oracle_t = _pad(oracle_t, n_time)
+        total_t = _pad(total_t, n_time)
+
+
+        # --- Publication-ish defaults (no explicit colors) ---
+        rc = {
+            "figure.dpi": 150,
+            "savefig.dpi": 300,
+            "font.size": 11,
+            "axes.titlesize": 12,
+            "axes.labelsize": 11,
+            "legend.fontsize": 10,
+            "xtick.labelsize": 10,
+            "ytick.labelsize": 10,
+            "axes.linewidth": 1.0,
+            "grid.linewidth": 0.6,
+            "lines.linewidth": 2.0,
+        }
+
+        with rc_context(rc):
+            if fig is None or axes is None:
+                fig, (ax_obj, ax_time) = plt.subplots(
+                    2, 1, sharex=False, figsize=(7.2, 6.2), constrained_layout=True
+                )
+            else:
+                ax_obj, ax_time = axes
+
+            # ---- Top panel: objective ----
+            ax_obj.plot(x_obj, y, marker="o", markersize=4, label="Objective")
+            ax_obj.plot(x_obj, best_so_far, label="Best so far")
+            ax_obj.scatter([best_x], [best_y], zorder=5, label=f"Best @ {best_x}")
+            ax_obj.set_ylabel("Objective")
+            ax_obj.set_title("Objective over evaluations")
+            ax_obj.grid(True, alpha=0.3)
+            ax_obj.legend(loc="best", frameon=False)
+
+            # ---- Bottom panel: timing ----
+            if n_time > 0:
+                ax_time.plot(x_time, train_t, marker="o", markersize=3, label="Train")
+                ax_time.plot(x_time, search_t, marker="o", markersize=3, label="Acq opt")
+                ax_time.plot(x_time, oracle_t, marker="o", markersize=3, label="Oracle")
+                ax_time.plot(x_time, total_t, marker="o", markersize=3, label="Total")
+                ax_time.set_xlabel("Iteration")
+                ax_time.set_ylabel("Time (s)")
+                ax_time.set_title("Timing per iteration")
+                ax_time.grid(True, alpha=0.3)
+                ax_time.legend(loc="best", frameon=False)
+            else:
+                ax_time.text(
+                    0.5,
+                    0.5,
+                    "No timing data available",
+                    ha="center",
+                    va="center",
+                    transform=ax_time.transAxes,
+                )
+                ax_time.set_axis_off()
+
+            # fig.suptitle(title or "BO run diagnostics", y=1.02)
+
+            if show:
+                plt.show()
+
+            return fig, (ax_obj, ax_time)
+

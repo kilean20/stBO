@@ -38,7 +38,7 @@ class TrustRegionState:
         self.failure_counter = 0
         self.best_value = -float("inf")
 
-    def update(self, y_new: float, x_new: torch.Tensor) -> None:
+    def update(self, y_new: float, x_new: torch.Tensor, adjust_trust_region=True) -> None:
         improved = True if not math.isfinite(self.best_value) else (
             y_new > self.best_value + 1e-3 * abs(self.best_value) + 1e-9
         )
@@ -52,10 +52,15 @@ class TrustRegionState:
             self.success_counter = 0
             self.failure_counter += 1
 
+        if not adjust_trust_region:
+            return
+        
         if self.success_counter >= self.success_tolerance:
+            print('tr increase')
             self.length = min(self.length * 2.0, self.length_max)
             self.success_counter = 0
         elif self.failure_counter >= self.failure_tolerance:
+            print('tr decrease')
             self.length = max(self.length / 2.0, self.length_min)
             self.failure_counter = 0
 

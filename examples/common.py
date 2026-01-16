@@ -9,4 +9,4 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 # Recommended defaults mirroring the prototype
 configure(default_dtype=torch.float64, suppress_warnings=True)
 
-ROSENBROCK2D_BOUNDS = torch.tensor([[-2.0, -2.0], [2.0, 3.0]], dtype=torch.float64)
+ROSENBROCK2D_BOUNDS = torch.tensor([[-2.0, -1.0], [2.0, 3.0]], dtype=torch.float64)
