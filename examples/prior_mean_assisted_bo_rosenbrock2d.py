@@ -1,7 +1,15 @@
 from __future__ import annotations
+import sys
+from pathlib import Path
 
-from .common import ROSENBROCK2D_BOUNDS as BOUNDS
-from .rosenbrock_prior import RosenbrockPrior
+# Ensure root and examples directory are in sys.path
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+if str(ROOT / "examples") not in sys.path:
+    sys.path.insert(0, str(ROOT / "examples"))
+
+import common 
 from stbo.optimization import BOController
 from stbo.oracles import RosenbrockOracle
 import matplotlib.pyplot as plt
