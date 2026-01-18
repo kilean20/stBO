@@ -1,4 +1,3 @@
-import os
 import sys
 from pathlib import Path
 
@@ -10,11 +9,13 @@ if str(ROOT) not in sys.path:
 def test_examples_smoke_run():
     import examples
 
+    # Discover and run each example's run() function
     names = getattr(examples, "__all__", None) or []
-    assert names, "examples.__all__ is empty - no runnable examples discovered."
+    assert names, "No runnable examples were discovered."
 
     for name in names:
         fn = getattr(examples, name)
         assert callable(fn), f"examples.{name} is not callable"
+        # The run() function now has the path injection internally
         out = fn(smoke=True)
-        assert out is not None, f"examples.{name}(smoke=True) returned None"
+        assert out is not None

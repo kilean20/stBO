@@ -3,7 +3,8 @@ import sys
 from pathlib import Path
 import torch
 
-# Add project root to sys.path to allow importing 'stbo' without installation
+# Path injection: Add the project root to sys.path
+# This assumes stbo/ is in the same directory as examples/
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
