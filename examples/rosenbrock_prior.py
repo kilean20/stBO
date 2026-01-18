@@ -7,10 +7,19 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from stbo.models import GPPriorMean
+# FIX: Import PriorMean (the correct class name) instead of GPPriorMean
+from stbo.models import PriorMean
 
-class RosenbrockPrior(GPPriorMean):
+class RosenbrockPrior(PriorMean):
     """A prior mean model for the Rosenbrock function."""
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Example implementation logic
-        return -((1.0 - x[..., 0])**2 + 100.0 * (x[..., 1] - x[..., 0]**2)**2)
+        # Calculate the negative Rosenbrock value (since we maximize)
+        # x is assumed to be (batch_shape) x q x d
+        # Output should be (batch_shape) x q x 1
+        
+        # Rosenbrock function: (1 - x)^2 + 100 * (y - x^2)^2
+        val = -((1.0 - x[..., 0])**2 + 100.0 * (x[..., 1] - x[..., 0]**2)**2)
+        
+        # Ensure correct output shape (add output dimension)
+        return val.unsqueeze(-1)
