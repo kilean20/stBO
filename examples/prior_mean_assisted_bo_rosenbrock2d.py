@@ -10,7 +10,7 @@ if str(ROOT / "examples") not in sys.path:
     sys.path.insert(0, str(ROOT / "examples"))
 
 import common 
-# Import the class from the local module (now fixed)
+# FIX: Import the class from the local file (rosenbrock_prior.py)
 from rosenbrock_prior import RosenbrockPrior
 from stbo.optimization import BOController
 from stbo.oracles import RosenbrockOracle
@@ -22,13 +22,23 @@ def run(smoke: bool = False, show_plots: bool = False) -> float:
     print("=== Example 2: Prior mean model ===")
     oracle = RosenbrockOracle(delay_s=0.0 if smoke else 1.0)
     
-    # Use common.ROSENBROCK2D_BOUNDS and the corrected Prior
-    bo = BOController(oracle, common.ROSENBROCK2D_BOUNDS, prior_mean=RosenbrockPrior())
+    # FIX: Use common.ROSENBROCK2D_BOUNDS
+    bo = BOController(
+        oracle, 
+        common.ROSENBROCK2D_BOUNDS, 
+        prior_mean=RosenbrockPrior()
+    )
 
     bo.initialize(budget=3 if smoke else 5, seed=0)
     n = 3 if smoke else 10
     for _ in range(n):
-        bo.step(mode="global", acq_type="qUCB", acq_config={"beta": 4}, fresh_train=True, plot_acq=show_plots)
+        bo.step(
+            mode="global", 
+            acq_type="qUCB", 
+            acq_config={"beta": 4}, 
+            fresh_train=True, 
+            plot_acq=show_plots
+        )
         if show_plots:
             plt.show()
 
