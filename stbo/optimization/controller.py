@@ -34,17 +34,16 @@ class BOController:
         bounds: torch.Tensor,
         *,
         use_readback: bool = True,
-        local_init: bool = False,
+        prior_mean: Optional[PriorMean] = None,
         kernel_type: str = "matern",
         max_workers: int = 1,
-        prior_mean: Optional[PriorMean] = None,
         adjust_trust_region: bool = True,
-        tr_length_init: float = 0.2,
+        tr_length_init: float = 0.2, # <--- CHANGED: Default small start (20%)
     ):
         self.oracle = oracle_evaluator
         self.bounds = bounds.to(dtype=torch.float64)
         self.use_readback = bool(use_readback)
-        self.local_init = bool(local_init)
+
         self.gp = BoTorchGPWrapper(kernel_type=kernel_type, prior_mean=prior_mean)
 
         self.executor = ThreadPoolExecutor(max_workers=int(max_workers))
@@ -61,6 +60,8 @@ class BOController:
         self.X_last = torch.tensor(init_res["x"], dtype=torch.float64)
 
         self.adjust_trust_region = bool(adjust_trust_region)
+        
+        # Initialize Trust Region with the custom length
         self.tr_state = TrustRegionState(
             bounds.shape[1], 
             self.bounds, 
@@ -87,6 +88,8 @@ class BOController:
         self.history.append(res)
 
         self.X_last = torch.tensor(x_val, dtype=torch.float64)
+        
+        # Update TR state (success/failure/shrink/expand)
         self.tr_state.update(y_val, self.X_last, adjust_trust_region=self.adjust_trust_region)
         self.timing["total"].append(time.time() - self.t_submit)
 
@@ -124,7 +127,6 @@ class BOController:
         """Queue an initial design and submit the last point asynchronously."""
         init_bounds = self.bounds.clone()
         X_current = self.X_candidate if self.X_candidate is not None else self.X_last
-        local_init = local_init or self.local_init
 
         if local_init:
             span = self.bounds[1] - self.bounds[0]
@@ -154,6 +156,7 @@ class BOController:
 
 
     def _auto_ramp_cost_config(self, base_acq, *, asynchro: bool, mode: str) -> Dict[str, Any]:
+        # mode is already normalized to "global", "finetune", or "local"
         ramp_cost_config: Dict[str, Any] = {
             "penalize_pending": asynchro and mode != "finetune",
             "use_ramping_favor": mode == "global",
@@ -204,10 +207,7 @@ class BOController:
         if ramp_cost_config.get("polarity_penalty") is None:
             with torch.no_grad():
                 _, range_at_curr = estimate_L_C(X_current, scale_L=1.0, scale_C=1.0)
-                if mode == "global":
-                    ramp_cost_config["polarity_penalty"] = 0.2*range_at_curr
-                else:
-                    ramp_cost_config["polarity_penalty"] = 1.0*range_at_curr
+                ramp_cost_config["polarity_penalty"] = 0.2 * range_at_curr
 
         return ramp_cost_config
 
@@ -232,7 +232,10 @@ class BOController:
         self._update_model(fresh_train=fresh_train)
 
         t0 = time.time()
+        
+        # Robust normalization of the mode string
         mode_l = mode.lower().replace("_", "")
+        
         if mode_l in ("local", "finetune"):
             search_bounds = self.tr_state.get_bounds()
         else:
@@ -251,6 +254,7 @@ class BOController:
         base_acq = get_base_acq(self.gp, acq_type, X_pending=X_pen, acq_config=a_conf)
 
         if ramp_cost_config is None:
+            # pass normalized mode_l
             ramp_cost_config = self._auto_ramp_cost_config(base_acq, asynchro=asynchro, mode=mode_l)
 
         acq = RampingCostAwareAcquisition(
@@ -306,96 +310,96 @@ class BOController:
         fixed_values: Optional[Dict[int, float]],
         project_mode: str
     ):
-        """
-        Computes the projection of the function onto a 2D plane.
-        Uses Batched Gradient Ascent to find the maximum value along hidden dimensions
-        for each pixel. This scales efficiently to high dimensions.
-        """
-        bounds = self.bounds
-        dim = bounds.shape[1]
+        """Helper to compute projected function surface on a 2D grid."""
+        bounds_np = self.bounds.cpu().numpy()
+        dim = bounds_np.shape[1]
         
-        # 1. Create the 2D grid
-        grid_x = torch.linspace(bounds[0, dim_xaxis], bounds[1, dim_xaxis], n_each, device=bounds.device, dtype=torch.float64)
-        grid_y = torch.linspace(bounds[0, dim_yaxis], bounds[1, dim_yaxis], n_each, device=bounds.device, dtype=torch.float64)
-        grid_x, grid_y = torch.meshgrid(grid_x, grid_y, indexing='xy')
-        
-        # Flatten for batch processing: (N*N, 2)
-        batch_size = n_each * n_each
-        flat_x = grid_x.reshape(-1)
-        flat_y = grid_y.reshape(-1)
-        
-        # 2. Initialize the full candidate tensor
-        # Start at the Trust Region center (or X_last) to ensure we are looking at the relevant "slice"
-        # If we just used random, we might optimize to a distant peak. 
-        # Usually for visualization, we want to see the profile *around* the current state.
-        if self.tr_state.center is not None:
-            init_vec = self.tr_state.center
+        # 1. Define 2D plot grid
+        x = np.linspace(bounds_np[0, dim_xaxis], bounds_np[1, dim_xaxis], n_each)
+        y = np.linspace(bounds_np[0, dim_yaxis], bounds_np[1, dim_yaxis], n_each)
+        XX, YY = np.meshgrid(x, y) # (n, n)
+
+        # 2. Identify projection strategy
+        project_mode = project_mode.lower()
+        if project_mode in ['max', 'maximum']:
+            aggregator = np.nanmax
+        elif project_mode in ['min', 'minimum']:
+            aggregator = np.nanmin
+        elif project_mode in ['mean', 'average']:
+            aggregator = np.nanmean
         else:
-            init_vec = torch.mean(bounds, dim=0)
-            
-        # Expand to batch
-        X = init_vec.unsqueeze(0).repeat(batch_size, 1).clone()
-        
-        # 3. Set the fixed dimension values
-        X[:, dim_xaxis] = flat_x
-        X[:, dim_yaxis] = flat_y
-        
-        # Also apply any user-specified fixed values
-        if fixed_values:
-            for d, v in fixed_values.items():
-                X[:, d] = v
-                
-        # 4. Identify hidden dimensions (those we can optimize)
-        fixed_dims = {dim_xaxis, dim_yaxis}
-        if fixed_values:
-            fixed_dims.update(fixed_values.keys())
-        
-        hidden_dims = [d for d in range(dim) if d not in fixed_dims]
+            raise ValueError(f"Unknown project_mode: {project_mode}")
 
-        # 5. Optimize if requested (project_mode == 'max') and there are hidden dims
-        # Note: If project_mode is NOT max, we simply evaluate the "slice" through init_vec.
-        if hidden_dims and project_mode.lower() in ['max', 'maximum']:
-            X.requires_grad_(True)
-            # Use aggressive learning rate for quick visualization convergence
-            optimizer = torch.optim.Adam([X], lr=0.05)
-            
-            # Optimization loop (Projected Profile)
-            # We want to MAXIMIZE func(X), so we minimize -func(X).
-            for _ in range(25):
-                optimizer.zero_grad()
-                val = func(X.unsqueeze(1)) # func expects (batch, q=1, d)
-                
-                # Handle possible return shapes (batch, 1) or (batch)
-                if val.ndim > 1:
-                    val = val.squeeze()
-                
-                loss = -torch.sum(val)
-                loss.backward()
-                
-                # Zero out gradients for the FIXED dimensions to strictly respect the grid
-                with torch.no_grad():
-                    mask = torch.zeros_like(X.grad)
-                    mask[:, hidden_dims] = 1.0
-                    X.grad.mul_(mask)
+        # 3. Setup hidden dimension grid
+        # If dim=2, there are no hidden dimensions to project over.
+        hidden_dims = [d for d in range(dim) if d != dim_xaxis and d != dim_yaxis]
+        
+        hidden_grids = []
+        for d in hidden_dims:
+            if fixed_values and d in fixed_values:
+                hidden_grids.append(np.array([fixed_values[d]]))
+            else:
+                hidden_grids.append(np.linspace(bounds_np[0, d], bounds_np[1, d], n_each))
+        
+        # Pre-construct the hidden mesh (shape: N_hidden x n_hidden_dims)
+        if hidden_grids:
+            hidden_mesh = np.meshgrid(*hidden_grids, indexing='xy') # cartesian
+            hidden_flat = [hm.ravel() for hm in hidden_mesh]
+            hidden_tensor = torch.tensor(
+                np.column_stack(hidden_flat), 
+                dtype=torch.float64, 
+                device=self.bounds.device
+            )
+        else:
+            hidden_tensor = torch.zeros((1, 0), dtype=torch.float64, device=self.bounds.device)
+
+        n_hidden_samples = hidden_tensor.shape[0]
+        vals_grid = np.zeros((n_each, n_each))
+
+        # 4. Iterate over the 2D plot pixels
+        # For each pixel (x, y), we evaluate func on the cartesian product {(x, y)} x {hidden_grid}
+        # This mirrors the user's snippet logic of "inner_grid"
+        for i in range(n_each):     # rows (Y)
+            for j in range(n_each): # cols (X)
+                cur_x = XX[i, j]
+                cur_y = YY[i, j]
+
+                # Create batch: (n_hidden_samples, dim)
+                # We start with empty or hidden tensor and insert x, y
+                if dim == 2:
+                     batch_x = torch.tensor([[cur_x, cur_y]], dtype=torch.float64, device=self.bounds.device)
+                     # Swap if axes are reversed
+                     if dim_xaxis == 1: 
+                         batch_x = batch_x[:, [1, 0]]
+                else:
+                    # Construct full tensor
+                    # hidden_tensor is (M, D-2). We need (M, D).
+                    # We can clone it and insert columns, or build list of columns.
+                    cols = [None] * dim
+                    cols[dim_xaxis] = torch.full((n_hidden_samples,), cur_x, dtype=torch.float64, device=self.bounds.device)
+                    cols[dim_yaxis] = torch.full((n_hidden_samples,), cur_y, dtype=torch.float64, device=self.bounds.device)
                     
-                optimizer.step()
-                
-                # Clamp to bounds
-                with torch.no_grad():
-                    X.clamp_(min=bounds[0], max=bounds[1])
-            
-            X.requires_grad_(False)
+                    hidden_idx = 0
+                    for d in range(dim):
+                        if d != dim_xaxis and d != dim_yaxis:
+                            cols[d] = hidden_tensor[:, hidden_idx]
+                            hidden_idx += 1
+                    
+                    batch_x = torch.stack(cols, dim=1)
 
-        # 6. Final Evaluation
-        with torch.no_grad():
-             vals = func(X.unsqueeze(1))
-             if vals.ndim > 1:
-                 vals = vals.squeeze()
-                 
-        vals_grid = vals.reshape(n_each, n_each).cpu().numpy()
-        XX = grid_x.cpu().numpy()
-        YY = grid_y.cpu().numpy()
-        
+                # Evaluate
+                with torch.no_grad():
+                    # model/acq usually expect (batch, q, d). q=1 implies unsqueeze(1).
+                    val_batch = func(batch_x.unsqueeze(1))
+                    
+                    # If func is Posterior mean (from BoTorchGPWrapper), it might return a Tensor (batch, 1) or similar.
+                    # BoTorch posterior.mean returns (batch, output_dim). Here output_dim=1.
+                    if isinstance(val_batch, torch.Tensor):
+                        val_batch = val_batch.detach().cpu().numpy()
+                    
+                # Aggregate
+                vals_grid[i, j] = aggregator(val_batch)
+
         return XX, YY, vals_grid
 
     def plot_acq(
@@ -404,7 +408,7 @@ class BOController:
         X_pending: Optional[torch.Tensor] = None,
         X_candidate: Optional[torch.Tensor] = None,
         search_bounds: Optional[torch.Tensor] = None,
-        n_each: int = 32,
+        n_each: int = 16,
         dim_xaxis: int = 0,
         dim_yaxis: int = 1,
         project_mode: str = "max",
@@ -415,8 +419,7 @@ class BOController:
         """2D helper plot with projection support for high dimensions.
         
         If problem dim > 2, projects the landscape onto dim_xaxis and dim_yaxis
-        using the aggregation strategy defined by project_mode.
-        'max' uses optimization (Profile Maximum). 'slice' or 'mean' uses center slice.
+        using the aggregation strategy defined by project_mode (max, min, mean).
         """
         if self.gp.model is None:
             return None
