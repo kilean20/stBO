@@ -108,7 +108,7 @@ class BoTorchGPWrapper(Model):
         bounds: torch.Tensor,
         *,
         fresh_train: bool = True,
-        train_method: str = "fit_gpytorch_mll_torch",
+        train_method: str = "fit_gpytorch_mll",
         torch_lr: float = 0.01,
         torch_steps: int = 250,
     ) -> None:

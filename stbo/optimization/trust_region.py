@@ -1,74 +1,82 @@
 from __future__ import annotations
-
 import math
+import torch
+from dataclasses import dataclass, field
 from typing import Optional
 
-import torch
-
-
+@dataclass
 class TrustRegionState:
-    """TuRBO-1 style trust region state for maximization."""
+    dim: int
+    bounds: torch.Tensor  # Global bounds (2, d)
+    # length is the fraction of the domain to search (0.0 to 1.0)
+    length: float = 0.8   
+    length_min: float = 0.5**7
+    length_max: float = 1.0 # <--- CHANGED: Max 100% of domain
+    failure_counter: int = 0
+    failure_tolerance: int = 16
+    success_counter: int = 0
+    success_tolerance: int = 10
+    best_value: float = -float("inf")
+    restart_triggered: bool = False
+    center: Optional[torch.Tensor] = None
 
-    def __init__(
-        self,
-        dim: int,
-        bounds: torch.Tensor,
-        *,
-        batch_size: int = 1,
-        success_tolerance: int = 3,
-        length_init: float = 0.1,
-        length_min: float = 0.005,
-        length_max: float = 1.0,
-    ):
-        self.dim = int(dim)
-        self.bounds = bounds
-        self.batch_size = int(batch_size)
+    def __post_init__(self):
+        # Ensure bounds are on the correct device/dtype
+        self.bounds = self.bounds.to(dtype=torch.float64)
 
-        self.success_tolerance = int(success_tolerance)
-        self.failure_tolerance = int(
-            math.ceil(max(4.0 / self.batch_size, float(self.dim) / self.batch_size))
-        )
+    def update(self, y_new: float, x_new: torch.Tensor, adjust_trust_region: bool = True):
+        """Update the trust region state based on the new observation."""
+        if x_new is None:
+            return
 
-        self.length = float(length_init)
-        self.length_min = float(length_min)
-        self.length_max = float(length_max)
-
-        self.center: Optional[torch.Tensor] = None
-        self.success_counter = 0
-        self.failure_counter = 0
-        self.best_value = -float("inf")
-
-    def update(self, y_new: float, x_new: torch.Tensor, adjust_trust_region=True) -> None:
-        improved = True if not math.isfinite(self.best_value) else (
-            y_new > self.best_value + 1e-3 * abs(self.best_value) + 1e-9
-        )
-
-        if improved:
+        # Check for improvement (using a small epsilon relative to best value)
+        # Note: We assume Maximization.
+        if y_new > self.best_value + 1e-3 * math.fabs(self.best_value):
             self.success_counter += 1
             self.failure_counter = 0
-            self.best_value = float(y_new)
-            self.center = x_new
+            self.best_value = y_new
+            self.center = x_new.clone()
         else:
             self.success_counter = 0
             self.failure_counter += 1
+            # If we haven't established a center yet, use the current point
+            if self.center is None:
+                self.center = x_new.clone()
 
-        if not adjust_trust_region:
-            return
-        
-        if self.success_counter >= self.success_tolerance:
-            print('tr increase')
-            self.length = min(self.length * 2.0, self.length_max)
-            self.success_counter = 0
-        elif self.failure_counter >= self.failure_tolerance:
-            print('tr decrease')
-            self.length = max(self.length / 2.0, self.length_min)
-            self.failure_counter = 0
+        if adjust_trust_region:
+            if self.success_counter >= self.success_tolerance:
+                self.length = min(2.0 * self.length, self.length_max)
+                self.success_counter = 0
+            elif self.failure_counter >= self.failure_tolerance:
+                self.length /= 2.0
+                self.failure_counter = 0
+
+            if self.length < self.length_min:
+                self.restart_triggered = True
+                # Prevent collapse if restarts are not handled externally
+                self.length = self.length_min * 2.0
 
     def get_bounds(self) -> torch.Tensor:
+        """
+        Calculate the trust region bounds in the original (unnormalized) space.
+        Scaling: bounds_width = length * global_domain_span
+        """
         if self.center is None:
             return self.bounds
-        span = self.bounds[1] - self.bounds[0]
-        L = self.length * span
-        lower = torch.max(self.bounds[0], self.center - L / 2)
-        upper = torch.min(self.bounds[1], self.center + L / 2)
-        return torch.stack([lower, upper])
+
+        # 1. Calculate the span of the global domain
+        domain_span = self.bounds[1] - self.bounds[0]
+
+        # 2. Scale the normalized length to the physical domain
+        # radius is half the side length
+        physical_radius = (self.length * domain_span) / 2.0
+
+        # 3. Compute raw bounds centered at self.center
+        lb = self.center - physical_radius
+        ub = self.center + physical_radius
+
+        # 4. Intersect with global bounds to ensure validity
+        lb = torch.max(lb, self.bounds[0])
+        ub = torch.min(ub, self.bounds[1])
+
+        return torch.stack([lb, ub])

@@ -3,11 +3,12 @@ from __future__ import annotations
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 
 from botorch.optim import optimize_acqf
 
@@ -33,15 +34,17 @@ class BOController:
         bounds: torch.Tensor,
         *,
         use_readback: bool = True,
-        prior_mean: Optional[PriorMean] = None,
+        local_init: bool = False,
         kernel_type: str = "matern",
         max_workers: int = 1,
+        prior_mean: Optional[PriorMean] = None,
         adjust_trust_region: bool = True,
+        tr_length_init: float = 0.2,
     ):
         self.oracle = oracle_evaluator
         self.bounds = bounds.to(dtype=torch.float64)
         self.use_readback = bool(use_readback)
-
+        self.local_init = bool(local_init)
         self.gp = BoTorchGPWrapper(kernel_type=kernel_type, prior_mean=prior_mean)
 
         self.executor = ThreadPoolExecutor(max_workers=int(max_workers))
@@ -58,7 +61,11 @@ class BOController:
         self.X_last = torch.tensor(init_res["x"], dtype=torch.float64)
 
         self.adjust_trust_region = bool(adjust_trust_region)
-        self.tr_state = TrustRegionState(bounds.shape[1], self.bounds)
+        self.tr_state = TrustRegionState(
+            bounds.shape[1], 
+            self.bounds, 
+            length=tr_length_init
+        )
         self.tr_state.center = self.X_last
         self.tr_state.best_value = float(init_res["y"])
 
@@ -110,13 +117,14 @@ class BOController:
         *,
         budget: int,
         local_init: bool = False,
-        ramping_rate: torch.Tensor | float | None = None,
+        ramping_rate: torch.Tensor | float | List[float] | None = None,
         fixed_features: Optional[Dict[int, float]] = None,
         seed: int | None = None,
     ) -> None:
         """Queue an initial design and submit the last point asynchronously."""
         init_bounds = self.bounds.clone()
         X_current = self.X_candidate if self.X_candidate is not None else self.X_last
+        local_init = local_init or self.local_init
 
         if local_init:
             span = self.bounds[1] - self.bounds[0]
@@ -146,7 +154,6 @@ class BOController:
 
 
     def _auto_ramp_cost_config(self, base_acq, *, asynchro: bool, mode: str) -> Dict[str, Any]:
-        mode = mode.lower()
         ramp_cost_config: Dict[str, Any] = {
             "penalize_pending": asynchro and mode != "finetune",
             "use_ramping_favor": mode == "global",
@@ -197,7 +204,10 @@ class BOController:
         if ramp_cost_config.get("polarity_penalty") is None:
             with torch.no_grad():
                 _, range_at_curr = estimate_L_C(X_current, scale_L=1.0, scale_C=1.0)
-                ramp_cost_config["polarity_penalty"] = 0.2 * range_at_curr
+                if mode == "global":
+                    ramp_cost_config["polarity_penalty"] = 0.2*range_at_curr
+                else:
+                    ramp_cost_config["polarity_penalty"] = 1.0*range_at_curr
 
         return ramp_cost_config
 
@@ -222,7 +232,7 @@ class BOController:
         self._update_model(fresh_train=fresh_train)
 
         t0 = time.time()
-        mode_l = mode.lower()
+        mode_l = mode.lower().replace("_", "")
         if mode_l in ("local", "finetune"):
             search_bounds = self.tr_state.get_bounds()
         else:
@@ -271,6 +281,7 @@ class BOController:
             self.plot_acq(
                 X_pending=(X_pen.detach().squeeze(0) if X_pen is not None else None),
                 X_candidate=candidate.detach().squeeze(0),
+                search_bounds=search_bounds,
             )
 
         if asynchro and self.current_future is not None:
@@ -286,78 +297,216 @@ class BOController:
             self.X_candidate = None
             self._update_model(fresh_train=False)
 
+    def _compute_projected_grid(
+        self,
+        func,
+        dim_xaxis: int,
+        dim_yaxis: int,
+        n_each: int,
+        fixed_values: Optional[Dict[int, float]],
+        project_mode: str
+    ):
+        """
+        Computes the projection of the function onto a 2D plane.
+        Uses Batched Gradient Ascent to find the maximum value along hidden dimensions
+        for each pixel. This scales efficiently to high dimensions.
+        """
+        bounds = self.bounds
+        dim = bounds.shape[1]
+        
+        # 1. Create the 2D grid
+        grid_x = torch.linspace(bounds[0, dim_xaxis], bounds[1, dim_xaxis], n_each, device=bounds.device, dtype=torch.float64)
+        grid_y = torch.linspace(bounds[0, dim_yaxis], bounds[1, dim_yaxis], n_each, device=bounds.device, dtype=torch.float64)
+        grid_x, grid_y = torch.meshgrid(grid_x, grid_y, indexing='xy')
+        
+        # Flatten for batch processing: (N*N, 2)
+        batch_size = n_each * n_each
+        flat_x = grid_x.reshape(-1)
+        flat_y = grid_y.reshape(-1)
+        
+        # 2. Initialize the full candidate tensor
+        # Start at the Trust Region center (or X_last) to ensure we are looking at the relevant "slice"
+        # If we just used random, we might optimize to a distant peak. 
+        # Usually for visualization, we want to see the profile *around* the current state.
+        if self.tr_state.center is not None:
+            init_vec = self.tr_state.center
+        else:
+            init_vec = torch.mean(bounds, dim=0)
+            
+        # Expand to batch
+        X = init_vec.unsqueeze(0).repeat(batch_size, 1).clone()
+        
+        # 3. Set the fixed dimension values
+        X[:, dim_xaxis] = flat_x
+        X[:, dim_yaxis] = flat_y
+        
+        # Also apply any user-specified fixed values
+        if fixed_values:
+            for d, v in fixed_values.items():
+                X[:, d] = v
+                
+        # 4. Identify hidden dimensions (those we can optimize)
+        fixed_dims = {dim_xaxis, dim_yaxis}
+        if fixed_values:
+            fixed_dims.update(fixed_values.keys())
+        
+        hidden_dims = [d for d in range(dim) if d not in fixed_dims]
+
+        # 5. Optimize if requested (project_mode == 'max') and there are hidden dims
+        # Note: If project_mode is NOT max, we simply evaluate the "slice" through init_vec.
+        if hidden_dims and project_mode.lower() in ['max', 'maximum']:
+            X.requires_grad_(True)
+            # Use aggressive learning rate for quick visualization convergence
+            optimizer = torch.optim.Adam([X], lr=0.05)
+            
+            # Optimization loop (Projected Profile)
+            # We want to MAXIMIZE func(X), so we minimize -func(X).
+            for _ in range(25):
+                optimizer.zero_grad()
+                val = func(X.unsqueeze(1)) # func expects (batch, q=1, d)
+                
+                # Handle possible return shapes (batch, 1) or (batch)
+                if val.ndim > 1:
+                    val = val.squeeze()
+                
+                loss = -torch.sum(val)
+                loss.backward()
+                
+                # Zero out gradients for the FIXED dimensions to strictly respect the grid
+                with torch.no_grad():
+                    mask = torch.zeros_like(X.grad)
+                    mask[:, hidden_dims] = 1.0
+                    X.grad.mul_(mask)
+                    
+                optimizer.step()
+                
+                # Clamp to bounds
+                with torch.no_grad():
+                    X.clamp_(min=bounds[0], max=bounds[1])
+            
+            X.requires_grad_(False)
+
+        # 6. Final Evaluation
+        with torch.no_grad():
+             vals = func(X.unsqueeze(1))
+             if vals.ndim > 1:
+                 vals = vals.squeeze()
+                 
+        vals_grid = vals.reshape(n_each, n_each).cpu().numpy()
+        XX = grid_x.cpu().numpy()
+        YY = grid_y.cpu().numpy()
+        
+        return XX, YY, vals_grid
+
     def plot_acq(
         self,
         *,
         X_pending: Optional[torch.Tensor] = None,
         X_candidate: Optional[torch.Tensor] = None,
+        search_bounds: Optional[torch.Tensor] = None,
         n_each: int = 32,
+        dim_xaxis: int = 0,
+        dim_yaxis: int = 1,
+        project_mode: str = "max",
+        fixed_values: Optional[Dict[int, float]] = None,
         fig=None,
         axes=None,
     ):
-        """2D helper plot (requires dim=2)."""
+        """2D helper plot with projection support for high dimensions.
+        
+        If problem dim > 2, projects the landscape onto dim_xaxis and dim_yaxis
+        using the aggregation strategy defined by project_mode.
+        'max' uses optimization (Profile Maximum). 'slice' or 'mean' uses center slice.
+        """
         if self.gp.model is None:
             return None
-        if self.bounds.shape[1] != 2:
-            raise ValueError("plot_acq only supports 2D bounds.")
+        
+        dim = self.bounds.shape[1]
+        if dim_xaxis >= dim or dim_yaxis >= dim:
+            raise ValueError(f"Axes {dim_xaxis},{dim_yaxis} out of bounds for dim {dim}")
 
-        # # Make matplotlib CI-friendly
-        # try:
-        #     matplotlib.use("Agg", force=False)
-        # except Exception:
-        #     pass
+        # Make matplotlib CI-friendly
+        try:
+            plt.switch_backend('Agg') if not plt.get_backend() else None
+        except Exception:
+            pass
 
+        # 1. Compute Grids for Plotting
+        # We need three surfaces: Model Mean, Base Acq, Acq+Cost
+        
+        # A. Model Mean
+        def func_mean(x):
+            return self.gp.posterior(x).mean
 
-        bounds = self.bounds
-        x = np.linspace(bounds[0, 0].item(), bounds[1, 0].item(), n_each)
-        y = np.linspace(bounds[0, 1].item(), bounds[1, 1].item(), n_each)
-        XX, YY = np.meshgrid(x, y)
-        grid_x = torch.tensor(np.column_stack((XX.ravel(), YY.ravel())), dtype=torch.float64)
+        XX, YY, mean_vals = self._compute_projected_grid(
+            func_mean, dim_xaxis, dim_yaxis, n_each, fixed_values, project_mode
+        )
 
-        with torch.no_grad():
-            post = self.gp.posterior(grid_x)
-            mean = post.mean.view(n_each, n_each).cpu().numpy()
+        # B. Base Acquisition
+        if self.last_acq_object is not None:
+             def func_base(x):
+                 return self.last_acq_object.base_acq(x)
+             
+             _, _, base_vals = self._compute_projected_grid(
+                func_base, dim_xaxis, dim_yaxis, n_each, fixed_values, project_mode
+             )
+             
+             def func_final(x):
+                 return self.last_acq_object(x)
+             
+             _, _, final_vals = self._compute_projected_grid(
+                 func_final, dim_xaxis, dim_yaxis, n_each, fixed_values, project_mode
+             )
+        else:
+            base_vals = None
+            final_vals = None
 
         if fig is None:
             fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
-        c1 = axes[0].contourf(XX, YY, mean, levels=16)
-        plt.colorbar(c1, ax=axes[0])
-
-        train_x_np = torch.stack(self.train_x).cpu().numpy()
-        axes[0].scatter(train_x_np[:, 0], train_x_np[:, 1], c="k", marker=".", s=20, label="Data")
-        axes[0].set_title("Model Mean")
-
-        if self.last_acq_object is not None:
-            with torch.no_grad():
-                grid_in = grid_x.unsqueeze(1)
-                base_vals = (
-                    self.last_acq_object.base_acq(grid_in).view(n_each, n_each).cpu().numpy()
-                )
-                c2 = axes[1].contourf(XX, YY, base_vals, levels=16)
-                plt.colorbar(c2, ax=axes[1])
-                axes[1].set_title("Base Acquisition")
-
-                final_vals = self.last_acq_object(grid_in).view(n_each, n_each).cpu().numpy()
-                c3 = axes[2].contourf(XX, YY, final_vals, levels=16)
-                plt.colorbar(c3, ax=axes[2])
-                axes[2].set_title("Acq + Ramping Costs")
-
-                for i in range(1, 3):
-                    axes[i].scatter(
-                        train_x_np[:, 0], train_x_np[:, 1], c="k", marker=".", s=20, label="Data"
-                    )
-                    axes[i].legend()
-
-        for i in range(3):
+        # Helper to plot one panel
+        def _plot_panel(ax, Z, title):
+            c = ax.contourf(XX, YY, Z, levels=16)
+            plt.colorbar(c, ax=ax)
+            
+            # Scatter Data (Projected)
+            train_x_np = torch.stack(self.train_x).cpu().numpy()
+            # We scatter the projection of the data onto these two axes
+            ax.scatter(train_x_np[:, dim_xaxis], train_x_np[:, dim_yaxis], c="k", marker=".", s=20, label="Data (Proj)")
+            
+            # Scatter Pending/Candidate
             if X_pending is not None:
-                axes[i].scatter(X_pending[0], X_pending[1], c="r", marker="x", s=100, label="Pending")
+                p = X_pending.cpu().numpy()
+                ax.scatter(p[dim_xaxis], p[dim_yaxis], c="r", marker="x", s=100, label="Pending")
             if X_candidate is not None:
-                axes[i].scatter(
-                    X_candidate[0], X_candidate[1], c="b", marker="*", s=100, label="Candidate"
-                )
+                c_ = X_candidate.cpu().numpy()
+                ax.scatter(c_[dim_xaxis], c_[dim_yaxis], c="b", marker="*", s=100, label="Candidate")
+            
+            # Draw Search Bounds
+            if search_bounds is not None:
+                sb = search_bounds.cpu().numpy()
+                x0 = sb[0, dim_xaxis]
+                y0 = sb[0, dim_yaxis]
+                w = sb[1, dim_xaxis] - x0
+                h = sb[1, dim_yaxis] - y0
+                # Use zorder=10 to ensure it is drawn ON TOP of the contour plot
+                rect = Rectangle((x0, y0), w, h, linewidth=2, edgecolor='red', facecolor='none', linestyle='--', label='Search Region', zorder=10)
+                ax.add_patch(rect)
 
-        axes[0].legend()
+            ax.set_title(f"{title} ({project_mode}-proj)")
+            ax.set_xlabel(f"Dim {dim_xaxis}")
+            ax.set_ylabel(f"Dim {dim_yaxis}")
+            ax.legend()
+
+        _plot_panel(axes[0], mean_vals, "Model Mean")
+        
+        if base_vals is not None:
+            _plot_panel(axes[1], base_vals, "Base Acquisition")
+            _plot_panel(axes[2], final_vals, "Acq + Ramping Costs")
+        else:
+             axes[1].axis('off')
+             axes[2].axis('off')
+
         plt.tight_layout()
         return fig, axes
     
@@ -505,4 +654,3 @@ class BOController:
                 plt.show()
 
             return fig, (ax_obj, ax_time)
-
