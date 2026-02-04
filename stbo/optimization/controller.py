@@ -69,6 +69,7 @@ class BOController:
         )
         self.tr_state.center = self.X_last
         self.tr_state.best_value = float(init_res["y"])
+        self.local_init = False
 
         self.last_acq_object = None
         self.t_submit = None
@@ -127,6 +128,8 @@ class BOController:
         """Queue an initial design and submit the last point asynchronously."""
         init_bounds = self.bounds.clone()
         X_current = self.X_candidate if self.X_candidate is not None else self.X_last
+
+        self.local_init = local_init or self.local_init
 
         if local_init:
             span = self.bounds[1] - self.bounds[0]
@@ -207,7 +210,10 @@ class BOController:
         if ramp_cost_config.get("polarity_penalty") is None:
             with torch.no_grad():
                 _, range_at_curr = estimate_L_C(X_current, scale_L=1.0, scale_C=1.0)
-                ramp_cost_config["polarity_penalty"] = 0.2 * range_at_curr
+                if self.local_init:
+                    ramp_cost_config["polarity_penalty"] = 0.5 * range_at_curr
+                else:
+                    ramp_cost_config["polarity_penalty"] = 0.2 * range_at_curr
 
         return ramp_cost_config
 
