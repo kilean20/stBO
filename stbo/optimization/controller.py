@@ -54,6 +54,7 @@ class BOController:
         self.train_y: list[torch.Tensor] = []
         self.history: list[Dict[str, Any]] = []
         self.timing = {"train": [], "search": [], "oracle": [], "total": []}
+        self._oracle_detail_timing_keys: set[str] = set()
 
         # initial poll
         init_res = self.oracle(x=None)
@@ -74,12 +75,37 @@ class BOController:
         self.last_acq_object = None
         self.t_submit = None
 
+    def _append_oracle_detail_timing(self, res: Dict[str, Any]) -> None:
+        detail = res.get("timing") or {}
+        if not isinstance(detail, dict):
+            detail = {}
+
+        values: Dict[str, float] = {}
+        for key, value in detail.items():
+            key = str(key)
+            if key in {"train", "search", "oracle", "total"}:
+                key = f"oracle_detail_{key}"
+            try:
+                values[key] = float(value)
+            except (TypeError, ValueError):
+                continue
+
+        n_oracle = len(self.timing["oracle"])
+        all_keys = self._oracle_detail_timing_keys | set(values)
+        for key in sorted(all_keys):
+            if key not in self.timing:
+                self.timing[key] = [None] * max(n_oracle - 1, 0)
+            self.timing[key].append(values.get(key))
+
+        self._oracle_detail_timing_keys.update(values)
+
     def _register_data(self, res: Dict[str, Any]) -> None:
         if self.t_submit is None:
             self.t_submit = time.time()
         if "t_start" in res and "t_end" in res:
-            dt = (res["t_end"] - res["t_start"]).total_seconds()
-            self.timing["oracle"].append(dt)
+            oracle_dt = (res["t_end"] - res["t_start"]).total_seconds()
+            self.timing["oracle"].append(oracle_dt)
+            self._append_oracle_detail_timing(res)
 
         x_val = res.get("x_rd", res["x"]) if self.use_readback else res.get("x_set", res["x"])
         y_val = float(res["y"])
@@ -92,7 +118,15 @@ class BOController:
         
         # Update TR state (success/failure/shrink/expand)
         self.tr_state.update(y_val, self.X_last, adjust_trust_region=self.adjust_trust_region)
-        self.timing["total"].append(time.time() - self.t_submit)
+
+    def _append_total_wall_time(
+        self,
+        iteration_start: float,
+        iteration_end: Optional[float] = None,
+    ) -> None:
+        if iteration_end is None:
+            iteration_end = time.time()
+        self.timing["total"].append(iteration_end - iteration_start)
 
     def _submit_job(self, x: torch.Tensor) -> None:
         self.t_submit = time.time()
@@ -147,13 +181,19 @@ class BOController:
         )
 
         if self.current_future is not None:
-            self._register_data(self.current_future.result())
-
-        for i in range(budget - 1):
-            self._submit_job(samples[i])
+            iteration_start = self.t_submit or time.time()
             self._register_data(self.current_future.result())
             self.timing["train"].append(None)
             self.timing["search"].append(None)
+            self._append_total_wall_time(iteration_start)
+
+        for i in range(budget - 1):
+            self._submit_job(samples[i])
+            iteration_start = self.t_submit
+            self._register_data(self.current_future.result())
+            self.timing["train"].append(None)
+            self.timing["search"].append(None)
+            self._append_total_wall_time(iteration_start)
 
         self._submit_job(samples[-1])
 
@@ -232,6 +272,11 @@ class BOController:
     ) -> None:
         """One BO step (optimize acquisition, submit point, optionally async)."""
 
+        iteration_start = (
+            self.t_submit
+            if self.current_future is not None and self.t_submit is not None
+            else time.time()
+        )
         if (not asynchro) and (self.current_future is not None):
             self._register_data(self.current_future.result())
 
@@ -285,7 +330,8 @@ class BOController:
             fixed_features=fixed_features,
             **ok,
         )
-        self.timing["search"].append(time.time() - t0)
+        search_dt = time.time() - t0
+        self.timing["search"].append(search_dt)
 
         if plot_acq:
             self.plot_acq(
@@ -298,14 +344,18 @@ class BOController:
             self._register_data(self.current_future.result())
 
         self._submit_job(candidate.detach().squeeze(0))
+        self._append_total_wall_time(iteration_start, self.t_submit)
 
 
     def finalize(self) -> None:
         if self.current_future is not None:
+            iteration_start = self.t_submit or time.time()
             self._register_data(self.current_future.result())
             self.current_future = None
             self.X_candidate = None
             self._update_model(fresh_train=False)
+            self.timing["search"].append(None)
+            self._append_total_wall_time(iteration_start)
 
     def _compute_projected_grid(
         self,
@@ -407,6 +457,205 @@ class BOController:
                 vals_grid[i, j] = aggregator(val_batch)
 
         return XX, YY, vals_grid
+        
+        
+    def plot_model(
+        self,
+        *,
+        X_pending: Optional[torch.Tensor] = None,
+        X_candidate: Optional[torch.Tensor] = None,
+        search_bounds: Optional[torch.Tensor] = None,
+        n_each: int = 16,
+        dim_xaxis: int = 0,
+        dim_yaxis: int = 1,
+        project_mode: str = "max",
+        fixed_values: Optional[Dict[int, float]] = None,
+        fig=None,
+        ax=None,
+    ):
+        """Plot only the GP model mean surface (1st subplot of plot_acq).
+
+        Parameters
+        ----------
+        X_pending : torch.Tensor | None
+            Pending point to mark on the plot (red ×).
+        X_candidate : torch.Tensor | None
+            Candidate/next point to mark on the plot (blue ★).
+        search_bounds : torch.Tensor | None
+            If provided, draws a dashed rectangle showing the search region.
+        n_each : int
+            Grid resolution along each axis (default 16).
+        dim_xaxis : int
+            Which parameter dimension to place on the x-axis (default 0).
+        dim_yaxis : int
+            Which parameter dimension to place on the y-axis (default 1).
+        project_mode : str
+            How to project hidden dimensions onto the 2D slice.
+            One of ``"max"``, ``"min"``, or ``"mean"`` (default ``"max"``).
+        fixed_values : dict[int, float] | None
+            Pin specific hidden dimensions to a fixed value instead of
+            projecting over them.
+        fig : matplotlib.figure.Figure | None
+            Existing figure to draw on. If None, a new one is created.
+        ax : matplotlib.axes.Axes | None
+            Existing axes to draw on. If None, a new single-panel figure is
+            created.
+
+        Returns
+        -------
+        (fig, ax)
+        """
+        if self.gp.model is None:
+            return None
+
+        dim = self.bounds.shape[1]
+        if dim_xaxis >= dim or dim_yaxis >= dim:
+            raise ValueError(f"Axes {dim_xaxis},{dim_yaxis} out of bounds for dim {dim}")
+
+        # Make matplotlib CI-friendly
+        try:
+            plt.switch_backend('Agg') if not plt.get_backend() else None
+        except Exception:
+            pass
+
+        # Compute model mean surface
+        def func_mean(x):
+            return self.gp.posterior(x).mean
+
+        XX, YY, mean_vals = self._compute_projected_grid(
+            func_mean, dim_xaxis, dim_yaxis, n_each, fixed_values, project_mode
+        )
+
+        if fig is None or ax is None:
+            fig, ax = plt.subplots(1, 1, figsize=(6, 5))
+
+        # ---- Plot ----
+        c = ax.contourf(XX, YY, mean_vals, levels=16)
+        plt.colorbar(c, ax=ax)
+
+        # Scatter training data
+        train_x_np = torch.stack(self.train_x).cpu().numpy()
+        ax.scatter(
+            train_x_np[:, dim_xaxis], train_x_np[:, dim_yaxis],
+            c="k", marker=".", s=20, label="Data (Proj)"
+        )
+
+        # Scatter pending / candidate points
+        if X_pending is not None:
+            p = X_pending.cpu().numpy()
+            ax.scatter(p[dim_xaxis], p[dim_yaxis], c="r", marker="x", s=100, label="Pending")
+        if X_candidate is not None:
+            c_ = X_candidate.cpu().numpy()
+            ax.scatter(c_[dim_xaxis], c_[dim_yaxis], c="b", marker="*", s=100, label="Candidate")
+
+        # Draw search bounds rectangle
+        if search_bounds is not None:
+            sb = search_bounds.cpu().numpy()
+            x0 = sb[0, dim_xaxis]
+            y0 = sb[0, dim_yaxis]
+            w  = sb[1, dim_xaxis] - x0
+            h  = sb[1, dim_yaxis] - y0
+            from matplotlib.patches import Rectangle
+            rect = Rectangle(
+                (x0, y0), w, h,
+                linewidth=2, edgecolor='red', facecolor='none',
+                linestyle='--', label='Search Region', zorder=10
+            )
+            ax.add_patch(rect)
+
+        ax.set_title(f"Model Mean ({project_mode}-proj)")
+        ax.set_xlabel(f"Dim {dim_xaxis}")
+        ax.set_ylabel(f"Dim {dim_yaxis}")
+        ax.legend()
+
+        plt.tight_layout()
+        return fig, ax
+
+    def plot_model_pairs(
+        self,
+        dim_names: Optional[List[str]] = None,
+        *,
+        n_each: int = 16,
+        project_mode: str = "max",
+        fixed_values: Optional[Dict[int, float]] = None,
+        search_bounds: Optional[torch.Tensor] = None,
+        X_pending: Optional[torch.Tensor] = None,
+        X_candidate: Optional[torch.Tensor] = None,
+        fig=None,
+        axes=None,
+    ):
+        """Plot GP model mean for consecutive dimension pairs (x0,x1), (x2,x3), ...
+
+        Parameters
+        ----------
+        dim_names : list[str] | None
+            Names of each input dimension (e.g. control_CSETs).  When provided,
+            axis labels are set to the corresponding name; otherwise the default
+            ``plot_model`` labels ``Dim N`` are used.
+        n_each : int
+            Grid resolution per axis (default 16).
+        project_mode : str
+            Projection mode for hidden dims: ``"max"``, ``"min"``, or ``"mean"``.
+        fixed_values : dict[int, float] | None
+            Pin specific hidden dimensions to a fixed value.
+        search_bounds : torch.Tensor | None
+            If provided, draws a dashed search-region rectangle on every panel.
+        X_pending : torch.Tensor | None
+            Pending point marker (red ×).
+        X_candidate : torch.Tensor | None
+            Candidate/next point marker (blue ★).
+        fig : matplotlib.figure.Figure | None
+            Existing figure to draw on.  Created automatically if None.
+        axes : array-like of matplotlib.axes.Axes | None
+            Existing axes to draw on.  Created automatically if None.
+
+        Returns
+        -------
+        (fig, axes_flat)  –  figure and flattened axes array.
+        """
+        import math
+
+        dim = self.bounds.shape[1]
+        n_pairs = dim // 2
+
+        if n_pairs == 0:
+            raise ValueError("Need at least 2 dimensions to plot pairs.")
+
+        ncol = min(n_pairs, 3)
+        nrow = math.ceil(n_pairs / ncol)
+        fig_w = 3.5 * ncol
+        fig_h = 3.0 * nrow
+
+        if fig is None or axes is None:
+            fig, axes = plt.subplots(nrow, ncol, figsize=(fig_w, fig_h))
+
+        axes_flat = np.array(axes).flatten()
+
+        for i in range(n_pairs):
+            ax = axes_flat[i]
+            self.plot_model(
+                dim_xaxis=2 * i,
+                dim_yaxis=2 * i + 1,
+                n_each=n_each,
+                project_mode=project_mode,
+                fixed_values=fixed_values,
+                search_bounds=search_bounds,
+                X_pending=X_pending,
+                X_candidate=X_candidate,
+                fig=fig,
+                ax=ax,
+            )
+            if dim_names is not None:
+                ax.set_xlabel(dim_names[2 * i])
+                ax.set_ylabel(dim_names[2 * i + 1])
+
+        # Hide unused axes when n_pairs < nrow * ncol
+        for j in range(n_pairs, len(axes_flat)):
+            axes_flat[j].set_visible(False)
+
+        plt.tight_layout()
+        return fig, axes_flat
+
 
     def plot_acq(
         self,

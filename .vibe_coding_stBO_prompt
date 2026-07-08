@@ -1,0 +1,73 @@
+Build a Bayesian optimization (BO) code for a physical system that improves performance while minimizing operational disruption. See and understand the attached files for reference.
+
+
+	* Allow user supplies bounds for all controllable knobs
+	* asynchronous single-evaluation (q=1) BO to avoid wasting wall-clock time: compute the next decision while the system is still evaluating the oracle. Refer attached files (especially BO.py) how future is handled. 
+		* Make sure to append new pair of (x,f(x)) data after oracle returns the output. Do not append x (or xrd) only first and f(x) later
+		* Assumes oracle signature: oracle_evaluator(x=None) -> dict. If x=None, oracle returns the current setpoint ("x"), read-back point ("x_rd") and its objective function value ("y").
+			* allow "use_readback" user input. When it is True use "x_rd" instead of "x" for GP training data
+			* at first, use oracle_evaluator() to get current set and read-back point as well as the objective function value as the initial point. 
+		* use X_pending argument in qUCB or qLogEI (qLogExpectedImprovement) if base acquisition is qUCB or qLogEI otherwise, for UCB or LogEI (LogExpectedImprovement), explicitly penalize pending point as in "BO.py".
+	* accept acuiqisition function config from user.
+		* enable UCB, logEI, qUCB, qlogEI as a base acquisition function
+		* add more terms (see following bullets) to the base acquisition function (including pending point) based on the attached files ( the attached files are just reference. you should implement _auto_penal_favor similar way).
+	* Avoid pending point:
+		* refer attached files and use similar hyper parameter setting like "L_penal", "C_penal"
+		* do not use "L_penal", "C_penal" of the attached files when qUCB or qLogEI is used. Instead, in this case, use X_pending input arg for qUCB or qLogEI.
+	* Avoid costly knob excursion: prefer small moves when gains are similar.
+		* refer attached files and use similar hyper parameter setting like "L_favor", "C_favor"
+		* Assume all the control knobs ramp simutaneously - this means that largest excursion cost of controls knob is the total cost.
+	* Treat polarity flips as costly: discourage crossing the sign boundary for specified knobs by favoring current polaity.
+		* refer attached files and use similar hyper parameter setting like "polarity_penalty"
+		* make the polaity potential smooth using (negative) sigmoid with the decaying length "l_decay" to be 1e-4 times the corresponding dimension of the user provided bound. In addition, the center of sigmoid should be shifted toward the current polarity by "2*l_decay" so that sigmoid nearly saturate at zero of the cotrol knob domain (i.e. the polartiy crossing line). The negative sign over sigmoid is meant to discourage the polarity crossing or equivalently favor current sign.
+	* allow user provide fixed-feature argument and pass it to botorch's optimize_acq argument for candidate search. 
+
+
+	* Create model class that wraps singletaskGP from botorch
+		* take cofig for model structure: kernel types and properties. ('rbf, 'matern', etc)
+		* it incorporate optional user provided prior mean that is a callable function
+			* assume it takes input x of shape (batch_size, x_dim) and output of shape (batch_size, 1)
+			* assume it is child class of torch module and make it not trainable.
+			* add docstring for above assumption.
+			* 
+		* Handle prior mean model explicitly. 
+			* so that if prior mean is provided, the posterior model (single-task GP) should be trained to predict the difference:  y_diff = y-y_pred 
+			* Implement training member function that can optimzie hyper parameters given data. 
+				* Also allow fine tuning from previous hyper-parmaeters if user want. To do that expose an input arg "fresh_train" of logical type, default True. The purpose is to reduce training time especially when only a few more data is added to already existing large data. 
+					* If you cannot figure out how to register new train_X and train_Y, just re-create singleTaskGP and then use hyper-parameters from previous (previous iteration) model and then fine tune
+				* Making the traing routine as a member function is to handle the case when user provide prior mean function and thus internally process "y_diff = y-y_pred" for posterior model training.
+		* Implement posterior, foward and other neccessary member functions and variables to be consistent with botorch so that it can be used for general botorch acquisition function. 
+	* Implement high level user controls:
+		* Implement initialization method
+			* take number of initialization budget as an input
+				* Before evaluating oracles, order the the samples to minimize the ramping cost. Take similar approach as the proximial ordering method in the attached files. Add more inputs are ramping rate for each control knobs (default 0.1*boundary), polarity crossing time cost (default 15). And use these info to order starting from current set point. 
+					* user may also provide fixed feature value. In this case fix that feature. 
+				* evaluate oracles leaving the last sample.
+					* submit the job for last sample and train model and query candidate while the oracle is evaluating. Refer attached files how future is handled. 
+			* Expose local_init flag to user. When True, the random initialization candidate should be within local boundary. 
+			* assume the local boundary to be 10% of the global boundary. 
+			* allow user to call this again to take more initialization data
+				* this is useful when user use different fixed features for different initialization points. 
+				* in this case the following initialization should take the current pending point as the initial point to order the samples to minimize ramping cost.
+		* Implement the loop method
+			* Global optimization mode.
+			* Local trust-region mode to focus search near the current best point (implement TurBO with with one box)
+				* Allow user to turn off the ramping cost consideration, except the polarity crossing cost, as the local bound will likely handle it. 
+			* Fine tuning mode for greedy candidate search with posterior mean as the acuiqisition function. Do not consider any ramping costs in this case.
+		* Finalization to wait the pending oracle evaluation complete and update the model.
+		* implement plotting tool
+			* refer plot_2D_projection method in the attached files (util.py). 
+				* the maximum projection is novel way to indicate objective or acquisition landscape in projected domain as the goal is to maximize the objective or acquisition. 
+			* allow plotting model mean, base acquisition, acquisition after ramping cost consideration. 
+			* objective function value over iteration and best so far over iteration togather
+		* record model training time, candidate search time. Also record orcale evaluation time if orcale also returns two datatime time-stemps "t_start" and "t_end". Use them to record orcale evaluation time.
+
+	* Demonstration 4 examples with 2D rosenbrock function. Create oracle_evaluator for 2D rosenbrock. 
+		1. Global init (budget = 5) -> Global BO wih fresh_train=True and LogEI (budget=5)  -> Global BO wih fresh_train=False and qLogEI (budget=5)
+		2. Global init (budget = 5) -> Global BO wih prior mean model equal to the 2D rosenbrock, fresh_train=True and LogEI (budget=5)
+		3. Local init (budget = 5) -> Local BO (budget=10)-> Fine tune (budget=1)
+		4. Fixed feature demo:
+			4.1. Local initialization with 4 samples (budget = 4) with two samples x2 = 1, and two samples at x2 = 0. 
+			4.2. local optimization where x2 is fixed for every 2 iteration.
+			4.3. fine tune for 1 iteration
+		* all 4 examples should produce 3 plots for model mean, base acquisition (including pending point) and acquisition after ramping cost consideration. Do it for every iteration after initialization. Also, at the end of optimization, plot objective function value over iteration. Also plot time costs for model training, acquisition function optimization and oracle evaluation time. 
