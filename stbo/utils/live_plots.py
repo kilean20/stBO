@@ -16,8 +16,8 @@ Each class:
   3. The subprocess drains the Queue inside every animation frame.
   4. On stop(), a poison-pill freezes the animation but leaves the window open.
 
-Data extraction — two sources, always 1-to-1 aligned
-------------------------------------------------------
+Data extraction — two sources, aligned by control values
+--------------------------------------------------------
 OracleEvaluator.__call__ returns {'x', 'y', 'x_set', 't_start', 't_end'}
 and optional timing diagnostics to BOController; monitor PV readings live in
 oracle.history rather than bo.history.
@@ -28,10 +28,15 @@ with a non-None x.  Each Series contains the column-wise mean of the fetched
 DataFrame: control_CSETs + control_RDs + monitor_PVs.
 
 live_monitor_plot therefore reads:
-  • Monitor PV values      — oracle.history["mean"][i][pv_name]
+  • Monitor PV values      — matched oracle.history["mean"][k][pv_name]
   • Control CSET values    — bo.history[i]["x_set"][j]   (what was commanded)
-  • Control RD values      — oracle.history["mean"][i][rd_pv]  (what was read back)
+  • Control RD values      — matched oracle.history["mean"][k][rd_pv]  (what was read back)
   • Timestamps             — bo.history[i]["t_end"].timestamp()
+
+The oracle can contain extra raw monitor samples that are not BO training rows
+(for example a manual "set to best" call between runs).  The live monitor skips
+those rows by matching control values instead of assuming raw list indices are
+identical.
 
 Usage
 -----
@@ -100,6 +105,139 @@ def _series_get(series, pv_name: str) -> float:
         return float(np.squeeze(val))
     except (KeyError, TypeError, ValueError):
         return float("nan")
+
+
+def _pv_legend_labels(pvs: List[str]) -> List[str]:
+    """Return compact PV labels that still identify the device."""
+    if len(pvs) <= 1:
+        return list(pvs)
+
+    parts = [pv.split(":") for pv in pvs]
+    common_prefix_len = 0
+    for fields in zip(*parts):
+        if len(set(fields)) != 1:
+            break
+        common_prefix_len += 1
+
+    labels: List[str] = []
+    for pv, fields in zip(pvs, parts):
+        if len(fields) <= 2:
+            labels.append(pv)
+            continue
+
+        # Drop only the group-common leading prefix, but keep at least the
+        # device and signal fields so repeated suffixes remain distinguishable.
+        start = min(common_prefix_len, max(len(fields) - 2, 0))
+        labels.append(":".join(fields[start:]) or pv)
+
+    return labels if len(set(labels)) == len(labels) else list(pvs)
+
+
+def _array_from_entry(entry: Any, key: str) -> Optional[np.ndarray]:
+    """Return a flat float array from a BO history mapping value."""
+    try:
+        if isinstance(entry, dict):
+            value = entry.get(key)
+        else:
+            value = entry[key]
+    except (KeyError, TypeError):
+        return None
+    if value is None:
+        return None
+    try:
+        if hasattr(value, "detach"):
+            value = value.detach().cpu().numpy()
+        arr = np.asarray(value, dtype=float).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+    return arr
+
+
+def _values_from_series(series: Any, pvs: List[str]) -> Optional[np.ndarray]:
+    """Return flat PV values from an oracle mean row, or None if unavailable."""
+    if not pvs:
+        return None
+    values = np.asarray([_series_get(series, pv) for pv in pvs], dtype=float)
+    if values.shape != (len(pvs),) or np.any(~np.isfinite(values)):
+        return None
+    return values
+
+
+def _values_match(actual: Optional[np.ndarray], expected: Optional[np.ndarray]) -> bool:
+    if actual is None or expected is None or actual.shape != expected.shape:
+        return False
+    return bool(np.allclose(actual, expected, rtol=1e-7, atol=1e-10))
+
+
+def _oracle_row_matches_history_entry(
+    bo_entry: Any,
+    oracle_row: Any,
+    *,
+    cset_pvs: List[str],
+    rd_pvs: List[str],
+) -> bool:
+    """Return True when an oracle row belongs to the given BO history entry."""
+    rd_values = _values_from_series(oracle_row, rd_pvs)
+    for key in ("x_rd", "x"):
+        if _values_match(rd_values, _array_from_entry(bo_entry, key)):
+            return True
+
+    cset_values = _values_from_series(oracle_row, cset_pvs)
+    if _values_match(cset_values, _array_from_entry(bo_entry, "x_set")):
+        return True
+
+    return False
+
+
+def _align_oracle_means_to_bo_history(
+    bo_history: List[Any],
+    oracle_means: List[Any],
+    *,
+    cset_pvs: List[str],
+    rd_pvs: List[str],
+) -> List[int]:
+    """Map BO history indices to oracle mean indices, skipping extra raw rows.
+
+    The usual live path has equal lengths and matching raw indices.  Restored
+    notebooks can have additional oracle rows from manual calls such as
+    ``oracle(best_x)`` that are not in ``bo.history``; a monotonic match by
+    control values keeps resumed control readback plots aligned.
+    """
+    if not bo_history or not oracle_means:
+        return []
+
+    if not cset_pvs and not rd_pvs:
+        return list(range(min(len(bo_history), len(oracle_means))))
+
+    aligned: List[int] = []
+    oracle_pos = 0
+    for hist_idx, bo_entry in enumerate(bo_history):
+        remaining_history = len(bo_history) - hist_idx - 1
+        latest_start = len(oracle_means) - remaining_history
+        if oracle_pos >= latest_start:
+            break
+
+        match_idx: Optional[int] = None
+        for oracle_idx in range(oracle_pos, latest_start):
+            if _oracle_row_matches_history_entry(
+                bo_entry,
+                oracle_means[oracle_idx],
+                cset_pvs=cset_pvs,
+                rd_pvs=rd_pvs,
+            ):
+                match_idx = oracle_idx
+                break
+
+        if match_idx is None:
+            if oracle_pos < len(oracle_means):
+                match_idx = oracle_pos
+            else:
+                break
+
+        aligned.append(match_idx)
+        oracle_pos = match_idx + 1
+
+    return aligned
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -184,11 +322,9 @@ def _monitor_worker(
         if is_ctrl:
             ax.set_facecolor("#f5f0ff")
 
-        for k, pv in enumerate(pvs):
+        legend_labels = _pv_legend_labels(pvs)
+        for k, (pv, lbl) in enumerate(zip(pvs, legend_labels)):
             color = prop_cycle[k % len(prop_cycle)]
-            device = pv.split(":")[0]
-            suffix = pv.split(":")[-1]
-            lbl = f"{device} • {suffix}" if len(pvs) > 1 else pv
 
             # Solid line for CSET (or plain monitor) — always in legend
             (line,) = ax.plot([], [], lw=1.8, color=color,
@@ -527,13 +663,19 @@ class live_monitor_plot:
             bo_history   = self.bo.history
             oracle_means = self.oracle.history["mean"]   # list[pd.Series]
 
-            current_len = min(len(bo_history), len(oracle_means))
+            oracle_indices = _align_oracle_means_to_bo_history(
+                list(bo_history),
+                list(oracle_means),
+                cset_pvs=self._csets_flat,
+                rd_pvs=self._rds_flat,
+            )
+            current_len = len(oracle_indices)
 
             if current_len > self._last_len:
                 snapshots = []
 
                 for i in range(self._last_len, current_len):
-                    series   = oracle_means[i]
+                    series   = oracle_means[oracle_indices[i]]
                     bo_entry = bo_history[i]
                     pv_vals: Dict[str, float] = {}
 

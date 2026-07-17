@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import keyword
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, Optional, List
 
 import numpy as np
@@ -28,6 +31,13 @@ class BOController:
       - "y": scalar objective value (maximize)
     """
 
+    _DEFAULT_ADAPTIVE_ASYNC_CONFIG: Dict[str, Any] = {
+        "window": 5,
+        "min_observations": 3,
+        "enable_ratio": (0.5, 2.0),
+        "keep_ratio": (0.35, 2.5),
+    }
+
     def __init__(
         self,
         oracle_evaluator,
@@ -38,11 +48,13 @@ class BOController:
         kernel_type: str = "matern",
         max_workers: int = 1,
         adjust_trust_region: bool = True,
-        tr_length_init: float = 0.2, # <--- CHANGED: Default small start (20%)
+        tr_length_init: float = 0.2,
+        adaptive_async_config: Optional[Dict[str, Any]] = None,
     ):
         self.oracle = oracle_evaluator
         self.bounds = bounds.to(dtype=torch.float64)
         self.use_readback = bool(use_readback)
+        self.tr_length_init = float(tr_length_init)
 
         self.gp = BoTorchGPWrapper(kernel_type=kernel_type, prior_mean=prior_mean)
 
@@ -55,6 +67,10 @@ class BOController:
         self.history: list[Dict[str, Any]] = []
         self.timing = {"train": [], "search": [], "oracle": [], "total": []}
         self._oracle_detail_timing_keys: set[str] = set()
+        self.adaptive_async_config = self._normalize_adaptive_async_config(
+            adaptive_async_config
+        )
+        self.async_history: list[Dict[str, Any]] = []
 
         # initial poll
         init_res = self.oracle(x=None)
@@ -66,7 +82,7 @@ class BOController:
         self.tr_state = TrustRegionState(
             bounds.shape[1], 
             self.bounds, 
-            length=tr_length_init
+            length=self.tr_length_init
         )
         self.tr_state.center = self.X_last
         self.tr_state.best_value = float(init_res["y"])
@@ -74,6 +90,150 @@ class BOController:
 
         self.last_acq_object = None
         self.t_submit = None
+
+    @classmethod
+    def _normalize_adaptive_async_config(
+        cls,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        cfg = dict(cls._DEFAULT_ADAPTIVE_ASYNC_CONFIG)
+        if config:
+            cfg.update(dict(config))
+
+        cfg["window"] = max(1, int(cfg["window"]))
+        cfg["min_observations"] = max(1, int(cfg["min_observations"]))
+
+        for key in ("enable_ratio", "keep_ratio"):
+            value = cfg[key]
+            if not isinstance(value, (list, tuple)) or len(value) != 2:
+                raise ValueError(f"adaptive_async_config[{key!r}] must be a length-2 ratio.")
+            lo, hi = float(value[0]), float(value[1])
+            if not np.isfinite(lo) or not np.isfinite(hi) or lo < 0 or hi < lo:
+                raise ValueError(
+                    f"adaptive_async_config[{key!r}] must satisfy 0 <= lower <= upper."
+                )
+            cfg[key] = (lo, hi)
+
+        return cfg
+
+    @staticmethod
+    def _finite_float_or_none(value: Any) -> Optional[float]:
+        try:
+            value_f = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(value_f):
+            return None
+        return value_f
+
+    def _last_auto_async_decision(self) -> bool:
+        for entry in reversed(getattr(self, "async_history", []) or []):
+            if entry.get("requested") == "auto":
+                return bool(entry.get("resolved", False))
+        return False
+
+    def _adaptive_async_metrics(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        window = int(config["window"])
+        min_observations = int(config["min_observations"])
+        timing = getattr(self, "timing", {}) or {}
+
+        compute_values: list[float] = []
+        for train_t, search_t in zip(timing.get("train", []), timing.get("search", [])):
+            train_f = self._finite_float_or_none(train_t)
+            search_f = self._finite_float_or_none(search_t)
+            if train_f is None or search_f is None:
+                continue
+            compute_values.append(train_f + search_f)
+
+        oracle_values = [
+            value_f
+            for value in timing.get("oracle", [])
+            if (value_f := self._finite_float_or_none(value)) is not None
+        ]
+
+        compute_recent = compute_values[-window:]
+        oracle_recent = oracle_values[-window:]
+
+        metrics: Dict[str, Any] = {
+            "n_compute": len(compute_recent),
+            "n_oracle": len(oracle_recent),
+            "compute_time": None,
+            "oracle_time": None,
+            "ratio": None,
+            "reason": "",
+        }
+
+        if len(compute_recent) < min_observations or len(oracle_recent) < min_observations:
+            metrics["reason"] = "insufficient_timing_history"
+            return metrics
+
+        compute_time = float(np.median(np.asarray(compute_recent, dtype=float)))
+        oracle_time = float(np.median(np.asarray(oracle_recent, dtype=float)))
+        metrics["compute_time"] = compute_time
+        metrics["oracle_time"] = oracle_time
+
+        if oracle_time <= 0:
+            metrics["reason"] = "nonpositive_oracle_time"
+            return metrics
+
+        metrics["ratio"] = compute_time / oracle_time
+        return metrics
+
+    def _resolve_asynchro(
+        self,
+        asynchro: Any,
+        *,
+        mode: str,
+        adaptive_async_config: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        if not hasattr(self, "async_history"):
+            self.async_history = []
+
+        if isinstance(asynchro, str):
+            if asynchro.lower() != "auto":
+                raise ValueError("asynchro must be a bool or 'auto'.")
+
+            base_config = getattr(self, "adaptive_async_config", None)
+            config = self._normalize_adaptive_async_config(base_config)
+            if adaptive_async_config:
+                config = self._normalize_adaptive_async_config({**config, **adaptive_async_config})
+
+            metrics = self._adaptive_async_metrics(config)
+            ratio = metrics.get("ratio")
+            previous_auto = self._last_auto_async_decision()
+            resolved = False
+            if ratio is not None:
+                key = "keep_ratio" if previous_auto else "enable_ratio"
+                lower, upper = config[key]
+                resolved = bool(lower <= ratio <= upper)
+                metrics["reason"] = f"{'within' if resolved else 'outside'}_{key}"
+
+            record = {
+                "step_index": len(getattr(self, "async_history", []) or []),
+                "mode": mode,
+                "requested": "auto",
+                "resolved": resolved,
+                **metrics,
+            }
+            self.async_history.append(record)
+            return resolved
+
+        resolved = bool(asynchro)
+        self.async_history.append(
+            {
+                "step_index": len(getattr(self, "async_history", []) or []),
+                "mode": mode,
+                "requested": resolved,
+                "resolved": resolved,
+                "n_compute": None,
+                "n_oracle": None,
+                "compute_time": None,
+                "oracle_time": None,
+                "ratio": None,
+                "reason": "fixed",
+            }
+        )
+        return resolved
 
     def _append_oracle_detail_timing(self, res: Dict[str, Any]) -> None:
         detail = res.get("timing") or {}
@@ -141,14 +301,257 @@ class BOController:
 
         self.current_future = self.executor.submit(task)
 
-    def _update_model(self, *, fresh_train: bool = True) -> None:
+    def _update_model(
+        self,
+        *,
+        fresh_train: bool = True,
+        record_timing: bool = True,
+    ) -> None:
         if not self.train_x:
             return
         t0 = time.time()
         X = torch.stack(self.train_x)
         Y = torch.stack(self.train_y)
         self.gp.fit(X, Y, self.bounds, fresh_train=fresh_train)
-        self.timing["train"].append(time.time() - t0)
+        if record_timing:
+            self.timing["train"].append(time.time() - t0)
+
+    def _find_objective_function(self):
+        for func in getattr(self.oracle, "df_manipulators", []) or []:
+            owner = getattr(func, "__self__", None)
+            if (
+                owner is not None
+                and getattr(func, "__name__", "") == "calculate_objectives_from_df"
+                and callable(getattr(owner, "set_objective_weight", None))
+                and callable(getattr(owner, "__call__", None))
+            ):
+                return owner
+        raise ValueError(
+            "Could not find a SingleTaskObjectiveFunction attached to "
+            "oracle.df_manipulators."
+        )
+
+    def _reset_trust_region_to_best_history(self, y_values: List[float]) -> int:
+        if not y_values:
+            raise ValueError("Cannot reset trust region without objective values.")
+        best_idx = int(np.argmax(np.asarray(y_values, dtype=float)))
+        best_x = self.train_x[best_idx].clone()
+        self.tr_state.length = float(getattr(self, "tr_length_init", 0.2))
+        self.tr_state.success_counter = 0
+        self.tr_state.failure_counter = 0
+        self.tr_state.restart_triggered = False
+        self.tr_state.best_value = float(y_values[best_idx])
+        self.tr_state.center = best_x
+        return best_idx
+
+    @staticmethod
+    def _history_mapping_keys(row: Any) -> set[str]:
+        if isinstance(row, dict):
+            return set(row)
+        if hasattr(row, "index"):
+            return set(getattr(row, "index"))
+        return set()
+
+    @staticmethod
+    def _history_mapping_get(row: Any, key: str) -> Any:
+        if isinstance(row, dict):
+            return row[key]
+        return row[key]
+
+    @staticmethod
+    def _as_float_array(value: Any) -> np.ndarray:
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+        value = np.asarray(value, dtype=float)
+        return value.reshape(-1)
+
+    def _history_row_matches_train_x(self, row: Any, train_x: torch.Tensor) -> bool:
+        keys = self._history_mapping_keys(row)
+        names = getattr(self.oracle, "control_RDs" if self.use_readback else "control_CSETs", None)
+        if not names or len(names) != int(train_x.numel()):
+            return False
+        if any(name not in keys for name in names):
+            return False
+        try:
+            row_x = np.asarray(
+                [self._history_mapping_get(row, name) for name in names],
+                dtype=float,
+            ).reshape(-1)
+            train_x_np = train_x.detach().cpu().numpy().reshape(-1)
+        except (TypeError, ValueError):
+            return False
+        return bool(np.allclose(row_x, train_x_np, rtol=1e-7, atol=1e-10))
+
+    def _align_oracle_means_to_training_history(
+        self,
+        oracle_means: List[Any],
+        objective_function: Any,
+        old_y_values: List[float],
+    ) -> tuple[List[Any], int]:
+        n_train = len(old_y_values)
+        n_oracle = len(oracle_means)
+        if n_oracle < n_train:
+            raise ValueError(
+                "Cannot map historical raw objective PV values to BO training data. "
+                f"len(train_x)={len(self.train_x)}, len(train_y)={len(self.train_y)}, "
+                f"len(bo.history)={len(self.history)}, len(oracle.history['mean'])={n_oracle}."
+            )
+        if n_oracle == n_train:
+            return list(oracle_means), 0
+
+        composite_name = objective_function.composite_objective_name
+        candidates: list[tuple[int, int]] = []
+        for start in range(n_oracle - n_train + 1):
+            rows = oracle_means[start : start + n_train]
+            composite_values = []
+            has_composite_values = True
+            for row in rows:
+                if composite_name not in self._history_mapping_keys(row):
+                    has_composite_values = False
+                    break
+                try:
+                    composite_values.append(float(self._history_mapping_get(row, composite_name)))
+                except (TypeError, ValueError):
+                    has_composite_values = False
+                    break
+            if not has_composite_values:
+                continue
+            if not np.allclose(
+                np.asarray(composite_values, dtype=float),
+                np.asarray(old_y_values, dtype=float),
+                rtol=1e-7,
+                atol=1e-10,
+            ):
+                continue
+            x_matches = sum(
+                self._history_row_matches_train_x(row, train_x)
+                for row, train_x in zip(rows, self.train_x)
+            )
+            candidates.append((x_matches, start))
+
+        if candidates:
+            _, start = max(candidates, key=lambda item: (item[0], -item[1]))
+            return list(oracle_means[start : start + n_train]), start
+
+        x_candidates: list[tuple[int, int]] = []
+        for start in range(n_oracle - n_train + 1):
+            rows = oracle_means[start : start + n_train]
+            x_matches = sum(
+                self._history_row_matches_train_x(row, train_x)
+                for row, train_x in zip(rows, self.train_x)
+            )
+            if x_matches:
+                x_candidates.append((x_matches, start))
+        if x_candidates:
+            x_matches, start = max(x_candidates, key=lambda item: (item[0], -item[1]))
+            if x_matches == n_train:
+                return list(oracle_means[start : start + n_train]), start
+
+        raise ValueError(
+            "Cannot align oracle.history['mean'] rows to BO training data. "
+            "The oracle has extra raw-history rows, but no contiguous block matches "
+            "the stored BO objectives/readbacks. "
+            f"len(train_x)={len(self.train_x)}, len(train_y)={len(self.train_y)}, "
+            f"len(bo.history)={len(self.history)}, len(oracle.history['mean'])={n_oracle}."
+        )
+
+    def reweight_objectives(
+        self,
+        new_weight: Dict[str, float],
+        *,
+        refit_model: bool = True,
+        reset_trust_region: bool = True,
+    ) -> Dict[str, Any]:
+        if self.current_future is not None:
+            raise RuntimeError("Call finalize() before reweighting objectives.")
+        if not self.train_x or not self.train_y or not self.history:
+            raise ValueError("No BO training data are available to reweight.")
+
+        objective_function = self._find_objective_function()
+        old_weights = dict(getattr(objective_function, "objective_weight", {}) or {})
+        old_y_values = [
+            float(self._scalar_objective(value.detach().cpu().numpy().tolist()))
+            if isinstance(value, torch.Tensor)
+            else float(self._scalar_objective(value))
+            for value in self.train_y
+        ]
+        old_best = max(old_y_values) if old_y_values else None
+
+        oracle_history = getattr(self.oracle, "history", {}) or {}
+        oracle_means = oracle_history.get("mean", [])
+        n_train = len(self.train_y)
+        if len(self.train_x) != n_train or len(self.history) != n_train:
+            raise ValueError(
+                "Cannot map historical raw objective PV values to BO training data. "
+                f"len(train_x)={len(self.train_x)}, len(train_y)={len(self.train_y)}, "
+                f"len(bo.history)={len(self.history)}, len(oracle.history['mean'])={len(oracle_means)}."
+            )
+        oracle_training_means, oracle_history_start = self._align_oracle_means_to_training_history(
+            list(oracle_means),
+            objective_function,
+            old_y_values,
+        )
+
+        raw_history_values = []
+        required_pvs = list(objective_function.objective_PVs)
+        for idx, mean_series in enumerate(oracle_training_means):
+            available_keys = self._history_mapping_keys(mean_series)
+            if not available_keys:
+                raise ValueError(
+                    "Historical oracle mean rows must be pandas Series or dict-like "
+                    f"objects for reweighting; got {type(mean_series).__name__} "
+                    f"at oracle.history['mean'] index {oracle_history_start + idx}."
+                )
+            missing = [pv for pv in required_pvs if pv not in available_keys]
+            if missing:
+                raise ValueError(
+                    "Historical oracle mean is missing objective PVs for reweighting "
+                    f"at oracle.history['mean'] index {oracle_history_start + idx}: {missing}"
+                )
+            raw_history_values.append(
+                np.asarray(
+                    [self._history_mapping_get(mean_series, pv) for pv in required_pvs],
+                    dtype=float,
+                )
+            )
+
+        y_values: List[float] = []
+        try:
+            new_weights = objective_function.set_objective_weight(new_weight)
+            for raw_values in raw_history_values:
+                y = float(objective_function(raw_values).detach().cpu().reshape(-1)[0])
+                y_values.append(y)
+        except Exception:
+            objective_function.set_objective_weight(old_weights)
+            raise
+
+        for entry, mean_series, y in zip(self.history, oracle_training_means, y_values):
+            entry["y"] = y
+            mean_series[objective_function.composite_objective_name] = y
+
+        self.train_y = [
+            torch.tensor([y], dtype=torch.float64)
+            for y in y_values
+        ]
+        self.last_acq_object = None
+
+        best_idx = None
+        if reset_trust_region:
+            best_idx = self._reset_trust_region_to_best_history(y_values)
+
+        if refit_model:
+            self._update_model(fresh_train=True, record_timing=False)
+
+        return {
+            "old_weights": old_weights,
+            "new_weights": dict(new_weights),
+            "old_best": old_best,
+            "new_best": max(y_values),
+            "best_index": best_idx,
+            "n_recomputed": len(y_values),
+            "oracle_history_start": oracle_history_start,
+            "oracle_history_ignored": len(oracle_means) - len(y_values),
+        }
 
     def initialize(
         self,
@@ -198,10 +601,10 @@ class BOController:
         self._submit_job(samples[-1])
 
 
-    def _auto_ramp_cost_config(self, base_acq, *, asynchro: bool, mode: str) -> Dict[str, Any]:
+    def _auto_ramp_cost_config(self, base_acq, *, effective_pending: bool, mode: str) -> Dict[str, Any]:
         # mode is already normalized to "global", "finetune", or "local"
         ramp_cost_config: Dict[str, Any] = {
-            "penalize_pending": asynchro and mode != "finetune",
+            "penalize_pending": effective_pending and mode != "finetune",
             "use_ramping_favor": mode == "global",
             "L_penal": None,
             "C_penal": None,
@@ -210,7 +613,7 @@ class BOController:
             "polarity_penalty": None,
         }
 
-        X_current = self.X_candidate if asynchro else self.X_last
+        X_current = self.X_candidate if effective_pending else self.X_last
         if len(self.train_x) < 2:
             return ramp_cost_config
 
@@ -260,7 +663,7 @@ class BOController:
     def step(
         self,
         *,
-        asynchro: bool = True,
+        asynchro: Any = True,
         mode: str = "global",
         acq_type: str = "qUCB",
         acq_config: Optional[Dict[str, Any]] = None,
@@ -269,12 +672,21 @@ class BOController:
         fresh_train: bool = False,
         plot_acq: bool = False,
         optimize_kwargs: Optional[Dict[str, Any]] = None,
+        adaptive_async_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         """One BO step (optimize acquisition, submit point, optionally async)."""
 
+        mode_l = mode.lower().replace("_", "")
+        asynchro = self._resolve_asynchro(
+            asynchro,
+            mode=mode_l,
+            adaptive_async_config=adaptive_async_config,
+        )
+        has_pending = self.current_future is not None and self.X_candidate is not None
+        effective_pending = asynchro and has_pending
         iteration_start = (
             self.t_submit
-            if self.current_future is not None and self.t_submit is not None
+            if has_pending and self.t_submit is not None
             else time.time()
         )
         if (not asynchro) and (self.current_future is not None):
@@ -283,10 +695,7 @@ class BOController:
         self._update_model(fresh_train=fresh_train)
 
         t0 = time.time()
-        
-        # Robust normalization of the mode string
-        mode_l = mode.lower().replace("_", "")
-        
+
         if mode_l in ("local", "finetune"):
             search_bounds = self.tr_state.get_bounds()
         else:
@@ -294,7 +703,7 @@ class BOController:
 
         X_pen = (
             self.X_candidate.unsqueeze(0)
-            if (self.X_candidate is not None and asynchro)
+            if effective_pending
             else None
         )
 
@@ -306,7 +715,11 @@ class BOController:
 
         if ramp_cost_config is None:
             # pass normalized mode_l
-            ramp_cost_config = self._auto_ramp_cost_config(base_acq, asynchro=asynchro, mode=mode_l)
+            ramp_cost_config = self._auto_ramp_cost_config(
+                base_acq,
+                effective_pending=effective_pending,
+                mode=mode_l,
+            )
 
         acq = RampingCostAwareAcquisition(
             self.gp,
@@ -356,6 +769,509 @@ class BOController:
             self._update_model(fresh_train=False)
             self.timing["search"].append(None)
             self._append_total_wall_time(iteration_start)
+
+    def dump(
+        self,
+        path: str | Path,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Path:
+        """Dump BO run data to a single HDF5 file.
+
+        The file stores plain Python/numeric data derived from the controller,
+        not live runtime objects such as the executor, pending future, or
+        fitted GP. PyTorch tensors are converted before writing.
+        """
+        try:
+            import tables
+        except ImportError as exc:
+            raise ImportError("BOController.dump(..., .h5) requires PyTables (`tables`).") from exc
+
+        def _to_builtin(value):
+            if isinstance(value, torch.Tensor):
+                return _to_builtin(value.detach().cpu().numpy())
+            if isinstance(value, np.ndarray):
+                return _to_builtin(value.tolist())
+            if isinstance(value, np.generic):
+                return value.item()
+            if isinstance(value, datetime):
+                return value.isoformat()
+            if isinstance(value, dict):
+                return {str(key): _to_builtin(val) for key, val in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [_to_builtin(val) for val in value]
+
+            to_dict = getattr(value, "to_dict", None)
+            module = getattr(type(value), "__module__", "")
+            if callable(to_dict) and module.startswith("pandas"):
+                return _to_builtin(to_dict())
+
+            if value is None or isinstance(value, (str, int, float, bool)):
+                return value
+
+            return repr(value)
+
+        def _safe_name(name: str, used: set[str]) -> str:
+            safe = re.sub(r"\W+", "_", str(name)).strip("_")
+            if not safe:
+                safe = "item"
+            if keyword.iskeyword(safe):
+                safe = f"{safe}_"
+            if safe[0].isdigit():
+                safe = f"n_{safe}"
+            base = safe
+            idx = 1
+            while safe in used:
+                safe = f"{base}_{idx}"
+                idx += 1
+            used.add(safe)
+            return safe
+
+        def _string_array(values):
+            encoded = [str(value).encode("utf-8") for value in values]
+            itemsize = max([len(value) for value in encoded] + [1])
+            return np.asarray(encoded, dtype=f"S{itemsize}")
+
+        def _try_create_array(h5, parent, name: str, value):
+            if isinstance(value, bool):
+                return h5.create_array(parent, name, np.asarray(value, dtype=np.bool_))
+            if isinstance(value, int) and not isinstance(value, bool):
+                return h5.create_array(parent, name, np.asarray(value, dtype=np.int64))
+            if isinstance(value, float):
+                return h5.create_array(parent, name, np.asarray(value, dtype=np.float64))
+            if isinstance(value, str):
+                node = h5.create_array(parent, name, _string_array([value]))
+                node._v_attrs["python_type"] = "str"
+                node._v_attrs["encoding"] = "utf-8"
+                return node
+            if isinstance(value, list):
+                if not value:
+                    return None
+                if all(item is None or isinstance(item, (bool, int, float)) for item in value):
+                    has_none = any(item is None for item in value)
+                    arr = (
+                        np.asarray(
+                            [np.nan if item is None else item for item in value],
+                            dtype=np.float64,
+                        )
+                        if has_none
+                        else np.asarray(value)
+                    )
+                    node = h5.create_array(parent, name, arr)
+                    if has_none:
+                        node._v_attrs["none_as_nan"] = True
+                    return node
+                if all(isinstance(item, str) for item in value):
+                    node = h5.create_array(parent, name, _string_array(value))
+                    node._v_attrs["python_type"] = "list[str]"
+                    node._v_attrs["encoding"] = "utf-8"
+                    return node
+                try:
+                    arr = np.asarray(value)
+                except (TypeError, ValueError):
+                    return None
+                if arr.dtype != object and arr.dtype.kind in "biufc":
+                    return h5.create_array(parent, name, arr)
+            return None
+
+        def _write_value(h5, parent, name: str, value):
+            value = _to_builtin(value)
+            node = _try_create_array(h5, parent, name, value)
+            if node is not None:
+                return node
+
+            group = h5.create_group(parent, name)
+            if value is None:
+                group._v_attrs["python_type"] = "None"
+                return group
+
+            if isinstance(value, dict):
+                group._v_attrs["python_type"] = "dict"
+                used: set[str] = set()
+                for key, child_value in value.items():
+                    child_name = _safe_name(key, used)
+                    child = _write_value(h5, group, child_name, child_value)
+                    child._v_attrs["original_key"] = str(key)
+                return group
+
+            if isinstance(value, list):
+                group._v_attrs["python_type"] = "list"
+                group._v_attrs["length"] = len(value)
+                used: set[str] = set()
+                width = max(6, len(str(max(len(value) - 1, 0))))
+                for idx, child_value in enumerate(value):
+                    child_name = _safe_name(f"item_{idx:0{width}d}", used)
+                    child = _write_value(h5, group, child_name, child_value)
+                    child._v_attrs["list_index"] = idx
+                return group
+
+            group._v_attrs["python_type"] = type(value).__name__
+            group._v_attrs["repr"] = repr(value)
+            return group
+
+        path = Path(path)
+        if path.suffix.lower() not in {".h5", ".hdf5"}:
+            path = path.with_suffix(".h5")
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        tr_state = {
+            key: _to_builtin(value)
+            for key, value in vars(self.tr_state).items()
+        }
+
+        payload = {
+            "format": "stbo.BOController.dump",
+            "format_version": 2,
+            "created_at": datetime.now().isoformat(),
+            "metadata": metadata or {},
+            "history": self.history,
+            "timing": self.timing,
+            "async_history": getattr(self, "async_history", []),
+            "adaptive_async_config": getattr(
+                self,
+                "adaptive_async_config",
+                self._DEFAULT_ADAPTIVE_ASYNC_CONFIG,
+            ),
+            "train_x": self.train_x,
+            "train_y": self.train_y,
+            "bounds": self.bounds,
+            "use_readback": self.use_readback,
+            "tr_length_init": getattr(self, "tr_length_init", 0.2),
+            "X_last": self.X_last,
+            "X_candidate": self.X_candidate,
+            "trust_region": tr_state,
+            "oracle_history": getattr(self.oracle, "history", None),
+            "oracle_evaluator": (
+                self.oracle.to_dump_dict()
+                if callable(getattr(self.oracle, "to_dump_dict", None))
+                else None
+            ),
+        }
+
+        with tables.open_file(path, mode="w") as h5:
+            h5.root._v_attrs["format"] = payload["format"]
+            h5.root._v_attrs["format_version"] = payload["format_version"]
+            h5.root._v_attrs["created_at"] = payload["created_at"]
+
+            for key in [
+                "metadata",
+                "history",
+                "timing",
+                "async_history",
+                "adaptive_async_config",
+                "train_x",
+                "train_y",
+                "bounds",
+                "use_readback",
+                "tr_length_init",
+                "X_last",
+                "X_candidate",
+                "trust_region",
+                "oracle_history",
+                "oracle_evaluator",
+            ]:
+                _write_value(h5, h5.root, key, payload[key])
+
+        return path
+
+    @staticmethod
+    def read_dump(path: str | Path) -> Dict[str, Any]:
+        """Read a BOController HDF5 dump into plain Python data."""
+        try:
+            import tables
+        except ImportError as exc:
+            raise ImportError("BOController.read_dump(..., .h5) requires PyTables (`tables`).") from exc
+
+        def _attr(node, name: str, default=None):
+            try:
+                return getattr(node._v_attrs, name)
+            except AttributeError:
+                return default
+
+        def _decode(value):
+            if isinstance(value, bytes):
+                return value.decode("utf-8")
+            if isinstance(value, np.bytes_):
+                return bytes(value).decode("utf-8")
+            return value
+
+        def _nan_to_none(value):
+            if isinstance(value, float) and np.isnan(value):
+                return None
+            if isinstance(value, list):
+                return [_nan_to_none(item) for item in value]
+            return value
+
+        def _read_value(node):
+            if isinstance(node, tables.Group):
+                python_type = _attr(node, "python_type")
+                if python_type == "None":
+                    return None
+                if python_type == "list":
+                    children = list(node._v_children.values())
+                    children.sort(key=lambda child: _attr(child, "list_index", 0))
+                    return [_read_value(child) for child in children]
+
+                children = {}
+                for child_name, child in node._v_children.items():
+                    key = _attr(child, "original_key", child_name)
+                    children[str(key)] = _read_value(child)
+                if python_type in {None, "dict"}:
+                    return children
+                if "repr" in node._v_attrs:
+                    return _attr(node, "repr")
+                return children
+
+            python_type = _attr(node, "python_type")
+            data = node.read()
+
+            if python_type == "str":
+                return _decode(data.tolist()[0])
+            if python_type == "list[str]":
+                return [_decode(item) for item in data.tolist()]
+
+            if isinstance(data, np.ndarray) and data.dtype.kind == "S":
+                decoded = [_decode(item) for item in data.tolist()]
+                return decoded[0] if data.shape == (1,) else decoded
+
+            value = data.tolist() if hasattr(data, "tolist") else data
+            if _attr(node, "none_as_nan", False):
+                value = _nan_to_none(value)
+            return value
+
+        path = Path(path)
+        with tables.open_file(path, mode="r") as h5:
+            payload: Dict[str, Any] = {
+                "format": _attr(h5.root, "format"),
+                "format_version": _attr(h5.root, "format_version"),
+                "created_at": _attr(h5.root, "created_at"),
+            }
+            for child_name, child in h5.root._v_children.items():
+                payload[child_name] = _read_value(child)
+
+        return payload
+
+    @staticmethod
+    def _scalar_objective(value: Any) -> Any:
+        if isinstance(value, list) and len(value) == 1:
+            return value[0]
+        return value
+
+    @staticmethod
+    def _datetime_or_original(value: Any) -> Any:
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value)
+            except ValueError:
+                return value
+        if isinstance(value, dict) and value.get("__kind__") == "datetime.datetime":
+            try:
+                return datetime.fromisoformat(value["value"])
+            except (KeyError, ValueError, TypeError):
+                return value
+        return value
+
+    @classmethod
+    def _restore_history_entry(cls, entry: Any) -> Any:
+        if not isinstance(entry, dict):
+            return entry
+        entry = dict(entry)
+        if "y" in entry:
+            entry["y"] = cls._scalar_objective(entry["y"])
+        for key in ("t_start", "t_end"):
+            if key in entry:
+                entry[key] = cls._datetime_or_original(entry[key])
+        return entry
+
+    @staticmethod
+    def _tensor_or_none(value: Any) -> Optional[torch.Tensor]:
+        if value is None:
+            return None
+        return torch.tensor(value, dtype=torch.float64)
+
+    @staticmethod
+    def _tensor_list(values: Any, *, target_dim: Optional[int] = None) -> list[torch.Tensor]:
+        tensors: list[torch.Tensor] = []
+        for value in values or []:
+            tensor = torch.tensor(value, dtype=torch.float64)
+            if target_dim is not None:
+                tensor = tensor.reshape(target_dim)
+            tensors.append(tensor)
+        return tensors
+
+    def _restore_dump_payload(
+        self,
+        payload: Dict[str, Any],
+        *,
+        restore_oracle_history: bool = True,
+        fit_model: bool = False,
+    ) -> None:
+        bounds = payload.get("bounds", self.bounds)
+        self.bounds = torch.tensor(bounds, dtype=torch.float64)
+        self.use_readback = bool(payload.get("use_readback", self.use_readback))
+        self.tr_length_init = float(payload.get("tr_length_init", getattr(self, "tr_length_init", 0.2)))
+
+        history = []
+        for entry in payload.get("history", []) or []:
+            history.append(self._restore_history_entry(entry))
+        self.history = history
+
+        self.timing = {
+            str(key): list(value or [])
+            for key, value in (payload.get("timing", {}) or {}).items()
+        }
+        self.async_history = [
+            dict(entry)
+            for entry in (payload.get("async_history", []) or [])
+            if isinstance(entry, dict)
+        ]
+        self.adaptive_async_config = self._normalize_adaptive_async_config(
+            payload.get(
+                "adaptive_async_config",
+                getattr(self, "adaptive_async_config", None),
+            )
+        )
+        self._oracle_detail_timing_keys = {
+            key
+            for key in self.timing
+            if key not in {"train", "search", "oracle", "total"}
+        }
+
+        dim = int(self.bounds.shape[1])
+        self.train_x = self._tensor_list(payload.get("train_x", []), target_dim=dim)
+        self.train_y = [
+            torch.tensor([float(self._scalar_objective(value))], dtype=torch.float64)
+            for value in payload.get("train_y", []) or []
+        ]
+
+        self.X_last = self._tensor_or_none(payload.get("X_last"))
+        self.X_candidate = self._tensor_or_none(payload.get("X_candidate"))
+        self.current_future = None
+        self.t_submit = None
+        self.last_acq_object = None
+        self.local_init = False
+
+        tr_state = payload.get("trust_region", {}) or {}
+        self.tr_state = TrustRegionState(
+            dim=int(tr_state.get("dim", dim)),
+            bounds=self.bounds,
+            length=float(tr_state.get("length", 0.8)),
+            length_min=float(tr_state.get("length_min", 0.5**7)),
+            length_max=float(tr_state.get("length_max", 1.0)),
+            failure_counter=int(tr_state.get("failure_counter", 0)),
+            failure_tolerance=int(tr_state.get("failure_tolerance", 16)),
+            success_counter=int(tr_state.get("success_counter", 0)),
+            success_tolerance=int(tr_state.get("success_tolerance", 10)),
+            best_value=float(tr_state.get("best_value", -float("inf"))),
+            restart_triggered=bool(tr_state.get("restart_triggered", False)),
+            center=self._tensor_or_none(tr_state.get("center")),
+        )
+
+        if restore_oracle_history and self.oracle is not None:
+            oracle_bundle = payload.get("oracle_evaluator")
+            if oracle_bundle is not None and callable(getattr(self.oracle, "_restore_state_from_dump_dict", None)):
+                try:
+                    self.oracle._restore_state_from_dump_dict(
+                        oracle_bundle.get("state", {}) or {},
+                        restore_history=True,
+                    )
+                except Exception:
+                    pass
+            elif payload.get("oracle_history") is not None:
+                try:
+                    self.oracle.history = payload.get("oracle_history")
+                except Exception:
+                    pass
+
+        if fit_model and self.train_x and self.train_y:
+            self._update_model(fresh_train=True, record_timing=False)
+
+    def import_dump(
+        self,
+        path: str | Path,
+        *,
+        restore_oracle: bool = False,
+        restore_oracle_history: bool = True,
+        fit_model: bool = False,
+    ) -> Dict[str, Any]:
+        """Load a BOController HDF5 dump into this controller.
+
+        By default, the live oracle/executor/GP wrapper owned by this object
+        are retained. Historical data, timing, train tensors, bounds, and
+        trust-region state are replaced by the dump contents. Set
+        restore_oracle=True to replace the oracle from the dump bundle.
+        """
+        payload = self.read_dump(path)
+        if restore_oracle and payload.get("oracle_evaluator") is not None:
+            from machineIO.construct_machineIO import OracleEvaluator
+
+            self.oracle = OracleEvaluator.from_dump_dict(
+                payload["oracle_evaluator"],
+                restore_history=restore_oracle_history,
+            )
+        self._restore_dump_payload(
+            payload,
+            restore_oracle_history=restore_oracle_history,
+            fit_model=fit_model,
+        )
+        return payload
+
+    @classmethod
+    def from_dump(
+        cls,
+        path: str | Path,
+        oracle_evaluator=None,
+        *,
+        use_readback: Optional[bool] = None,
+        prior_mean: Optional[PriorMean] = None,
+        kernel_type: str = "matern",
+        adjust_trust_region: bool = True,
+        max_workers: int = 1,
+        restore_oracle_history: bool = True,
+        fit_model: bool = False,
+    ) -> "BOController":
+        """Construct a BOController from a dump without running an oracle poll."""
+        payload = cls.read_dump(path)
+        bounds = torch.tensor(payload["bounds"], dtype=torch.float64)
+        if oracle_evaluator is None and payload.get("oracle_evaluator") is not None:
+            from machineIO.construct_machineIO import OracleEvaluator
+
+            oracle_evaluator = OracleEvaluator.from_dump_dict(
+                payload["oracle_evaluator"],
+                restore_history=restore_oracle_history,
+            )
+
+        bo = cls.__new__(cls)
+        bo.oracle = oracle_evaluator
+        bo.bounds = bounds
+        bo.use_readback = bool(payload.get("use_readback", True) if use_readback is None else use_readback)
+        bo.tr_length_init = float(payload.get("tr_length_init", 0.2))
+        bo.adjust_trust_region = bool(adjust_trust_region)
+        bo.gp = BoTorchGPWrapper(kernel_type=kernel_type, prior_mean=prior_mean)
+        bo.executor = ThreadPoolExecutor(max_workers=int(max_workers))
+        bo.current_future = None
+        bo.X_candidate = None
+        bo.train_x = []
+        bo.train_y = []
+        bo.history = []
+        bo.timing = {"train": [], "search": [], "oracle": [], "total": []}
+        bo._oracle_detail_timing_keys = set()
+        bo.adaptive_async_config = cls._normalize_adaptive_async_config(
+            payload.get("adaptive_async_config")
+        )
+        bo.async_history = []
+        bo.X_last = None
+        bo.tr_state = TrustRegionState(bounds.shape[1], bounds)
+        bo.local_init = False
+        bo.last_acq_object = None
+        bo.t_submit = None
+
+        bo._restore_dump_payload(
+            payload,
+            restore_oracle_history=restore_oracle_history,
+            fit_model=fit_model,
+        )
+        return bo
 
     def _compute_projected_grid(
         self,
